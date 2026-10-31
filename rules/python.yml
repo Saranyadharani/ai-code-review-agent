@@ -1,0 +1,82 @@
+rules:
+- id: eval-use
+  pattern: eval(...)
+  message: eval() on dynamic input allows code execution
+  languages: [python]
+  severity: ERROR
+- id: pickle-load
+  pattern: pickle.load(...)
+  message: Unpickling untrusted data allows code execution
+  languages: [python]
+  severity: ERROR
+- id: bare-except
+  pattern: |
+    try:
+        ...
+    except:
+        ...
+  message: Bare except hides all errors
+  languages: [python]
+  severity: WARNING
+- id: sql-fstring
+  pattern: $C.execute(f"...")
+  message: SQL built with an f-string (injection risk)
+  languages: [python]
+  severity: ERROR
+- id: hardcoded-secret
+  pattern-regex: (?i)(api_key|secret|password|token)\s*=\s*["'][^"']{8,}["']
+  message: Hardcoded credential
+  languages: [generic]
+  severity: ERROR
+- id: aws-access-key
+  pattern-regex: AKIA[0-9A-Z]{16}
+  message: AWS access key identifier
+  languages: [generic]
+  severity: ERROR
+- id: database-uri-password
+  pattern-regex: (?i)[a-z][a-z0-9+.-]*://[^:/@\s]+:[^/@\s]+@[^/\s]+
+  message: Database URI contains an embedded password
+  languages: [generic]
+  severity: ERROR
+- id: os-system
+  pattern: os.system($COMMAND)
+  message: os.system executes a command through a shell
+  languages: [python]
+  severity: ERROR
+- id: subprocess-shell-true
+  patterns:
+    - pattern-either:
+        - pattern: subprocess.$FUNC(..., shell=True, ...)
+        - pattern: subprocess.$FUNC(..., shell=True)
+  message: subprocess call enables shell execution
+  languages: [python]
+  severity: ERROR
+- id: yaml-unsafe-load
+  patterns:
+    - pattern: yaml.load($DATA, ...)
+    - pattern-not: yaml.load($DATA, Loader=yaml.SafeLoader)
+  message: yaml.load without SafeLoader can construct unsafe objects
+  languages: [python]
+  severity: ERROR
+- id: pickle-loads
+  pattern: pickle.loads($DATA)
+  message: Unpickling untrusted data allows code execution
+  languages: [python]
+  severity: ERROR
+- id: hashlib-weak-hash
+  pattern-either:
+    - pattern: hashlib.md5(...)
+    - pattern: hashlib.sha1(...)
+  message: Weak hash algorithm used
+  languages: [python]
+  severity: WARNING
+- id: random-credential
+  patterns:
+    - pattern-either:
+        - pattern: $VAR = random.$FUNC(...)
+    - metavariable-regex:
+        metavariable: $VAR
+        regex: (?i).*(token|password|secret).*
+  message: Use secrets module for credentials instead of random
+  languages: [python]
+  severity: WARNING
