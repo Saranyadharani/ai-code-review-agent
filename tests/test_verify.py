@@ -147,6 +147,59 @@ async def test_return_shape_guard_allows_a_finding_about_return_shape(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_verify_fixes_accepts_base_source_and_recognizes_revert(monkeypatch):
+    monkeypatch.setattr(verify, "run_semgrep", lambda source: [])
+    source = "def calculate(value):\n    return value - 1\n"
+    base_source = "def calculate(value):\n    return value + 1\n"
+    finding = {
+        "line": 2,
+        "category": "bug",
+        "title": "Incorrect arithmetic",
+        "fix": {
+            "original": "return value - 1",
+            "replacement": "return value + 1",
+            "critic_safe": True,
+        },
+    }
+
+    result = await verify.verify_fixes(
+        source,
+        [finding],
+        base_source=base_source,
+        unified_diff=(
+            "@@ -2 +2 @@\n"
+            "-    return value + 1\n"
+            "+    return value - 1\n"
+        ),
+    )
+
+    assert result["accepted"] == 1
+    assert finding["fix"]["base_revert"] is True
+    assert finding["fix"]["verified"] is True
+
+
+@pytest.mark.asyncio
+async def test_security_fix_may_add_a_required_configuration_parameter(monkeypatch):
+    monkeypatch.setattr(verify, "run_semgrep", lambda source: [])
+    source = "def connect(host):\n    return host\n"
+    finding = {
+        "line": 1,
+        "category": "security",
+        "title": "Security defect needs configured credentials",
+        "fix": {
+            "original": "def connect(host):",
+            "replacement": "def connect(host, credential):",
+            "critic_safe": True,
+        },
+    }
+
+    result = await verify.verify_fixes(source, [finding])
+
+    assert result["accepted"] == 1
+    assert finding["fix"]["verified"] is True
+
+
+@pytest.mark.asyncio
 async def test_explicit_critic_rejection_blocks_deterministically_valid_fix(monkeypatch):
     monkeypatch.setattr(verify, "run_semgrep", lambda source: [])
     finding = {

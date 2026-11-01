@@ -10,7 +10,12 @@ from pyflakes.api import check
 from pyflakes.reporter import Reporter
 
 from app.context import run_semgrep
-from app.review_rules import ensure_finding_id, find_text_occurrence, finding_concerns
+from app.review_rules import (
+    ensure_finding_id,
+    find_text_occurrence,
+    finding_concerns,
+    finding_value,
+)
 
 log = logging.getLogger("review-agent")
 
@@ -219,7 +224,8 @@ def _fix_problems(source: str, patched: str, finding, fix: dict) -> list[str]:
     if new_names:
         problems.append("Introduces undefined names: " + ", ".join(sorted(new_names)))
 
-    if not fix.get("base_revert") and (
+    is_security_defect = finding_value(finding, "category", "") == "security"
+    if not fix.get("base_revert") and not is_security_defect and (
         not finding_concerns(finding, "signature")
         and _function_signatures(source) != _function_signatures(patched)
     ):
@@ -343,7 +349,12 @@ def _set_verified(finding, fix: dict, verified: bool, problems: list[str]) -> No
         finding["fix"] = fix
 
 
-async def verify_fixes(source: str, findings: list) -> dict:
+async def verify_fixes(
+    source: str,
+    findings: list,
+    base_source: str | None = None,
+    unified_diff: str = "",
+) -> dict:
     """Verify each proposed fix, then check all accepted fixes together."""
     accepted = []
     for finding in findings:
@@ -378,6 +389,12 @@ async def verify_fixes(source: str, findings: list) -> dict:
             continue
         offset, start_line = occurrence
         fix["start_line"] = start_line
+        if base_source is not None and not fix.get("base_revert"):
+            fix["base_revert"] = is_base_version_revert(
+                source, base_source, unified_diff, finding, original, replacement
+            )
+            if fix["base_revert"]:
+                fix["critic_safe"] = True
         patched = source[:offset] + replacement + source[offset + len(original):]
         problems = _fix_problems(source, patched, finding, fix)
         _set_verified(finding, fix, not problems, problems)

@@ -23,6 +23,28 @@ from app.verify import is_base_version_revert, verify_fixes
 
 log = logging.getLogger("review-agent")
 CRITIC_TIMEOUT_SECONDS = 20
+QUALITY_FINDINGS_PER_FUNCTION = 3
+
+
+def _configured_categories() -> set[str]:
+    return {
+        category.strip().lower()
+        for category in settings.review_categories.split(",")
+        if category.strip()
+    }
+
+
+def _function_for_line(line: int, functions: list[dict]) -> str:
+    matches = [
+        function
+        for function in functions
+        if isinstance(function.get("start"), int)
+        and isinstance(function.get("end"), int)
+        and function["start"] <= line <= function["end"]
+    ]
+    if not matches:
+        return "<module>"
+    return min(matches, key=lambda function: function["end"] - function["start"])["name"]
 
 class Finding(BaseModel):
     id: str = ""
@@ -171,15 +193,35 @@ async def performance_node(s: State):
 
 
 async def quality_node(s: State):
+    if "quality" not in _configured_categories():
+        return {"quality": []}
     hints = "\n".join(
         f"- line {h['line']}: {h['rule']}: {h['message']}"
         for h in s["ctx"].get("ruff", []) if h["category"] == "quality"
     ) or "none"
     data = await ask_json(
         "TASK: CODE QUALITY. Report actionable issues in CHANGED functions only: PEP 8 naming, deeply "
-        "nested/long/complex functions, dead code, and missing docstrings or type hints. Ruff hints:\n"
+        "nested/long/complex functions, dead code, and missing docstrings or type hints. "
+        f"Return no more than {QUALITY_FINDINGS_PER_FUNCTION} findings per function. Ruff hints:\n"
         f"{hints}\nReply as JSON object with key \"findings\" (a list). {KEYS}\n\n" + _header(s))
-    return {"quality": _build(data or [], "findings", "quality")}
+    findings = _build(data or [], "findings", "quality")
+    counts: dict[str, int] = {}
+    kept = []
+    functions = s["ctx"].get("functions", [])
+    for finding in sorted(findings, key=lambda item: (
+        {"critical": 0, "high": 1, "medium": 2, "low": 3}.get(item.severity.lower(), 4),
+        item.line,
+    )):
+        function = _function_for_line(finding.line, functions)
+        if counts.get(function, 0) >= QUALITY_FINDINGS_PER_FUNCTION:
+            log.info(
+                "finding_dropped id=%s category=quality reason=per_function_quality_cap:%s",
+                ensure_finding_id(finding), function,
+            )
+            continue
+        counts[function] = counts.get(function, 0) + 1
+        kept.append(finding)
+    return {"quality": kept}
 
 
 async def impact_node(s: State):
@@ -288,14 +330,25 @@ async def validate_node(s: State):
                 "finding_dropped id=%s category=%s reason=static_hint_covered",
                 ensure_finding_id(candidate), candidate.category,
             )
-    allowed_categories = {
-        category.strip().lower()
-        for category in settings.review_categories.split(",")
-        if category.strip()
-    }
+    allowed_categories = _configured_categories()
     filtered = []
     for finding in merged:
         category = correct_category(finding)
+        if is_style_only(finding) and category != "security":
+            if "quality" not in allowed_categories:
+                log.info(
+                    "finding_dropped id=%s category=%s reason=quality_not_enabled",
+                    ensure_finding_id(finding), category,
+                )
+                continue
+            finding.category = "quality"
+            category = "quality"
+        if category == "quality" and "quality" not in allowed_categories:
+            log.info(
+                "finding_dropped id=%s category=quality reason=quality_not_enabled",
+                ensure_finding_id(finding),
+            )
+            continue
         if category in {"performance", "quality"} and finding.severity.lower() == "low":
             if category not in allowed_categories:
                 log.info(
@@ -316,9 +369,14 @@ async def validate_node(s: State):
 
 async def fix_node(s: State):
     """Ask for fixes and an independent behavior-preservation critique."""
+    quality_enabled = "quality" in _configured_categories()
     todo = [
         f for f in s["findings"]
-        if f.severity in ("high", "medium") and f.category != "impact"
+        if f.severity in ("high", "medium")
+        and f.category != "impact"
+        and (quality_enabled or (
+            f.category != "quality" and not is_style_only(f)
+        ))
     ]
     eligible_ids = {ensure_finding_id(finding) for finding in todo}
     for finding in s["findings"]:
@@ -424,7 +482,10 @@ async def fix_node(s: State):
             "Does this fix correct the flagged defect WITHOUT breaking valid uses? "
             "Changing the buggy behaviour is expected and allowed. Reject only if it changes the "
             "public signature, return type or data/file format for valid inputs, removes the flagged "
-            "functionality, swaps the flagged code for a trivial value, or alters unrelated lines.\n"
+            "functionality, swaps the flagged code for a trivial value, or alters unrelated lines. "
+            "Externalizing a hardcoded secret to an environment variable or configuration is an "
+            "accepted security fix, not a behavior break. For an original security defect, adding a "
+            "required configuration input is allowed.\n"
             "Reply strictly as JSON with exactly these keys and types: "
             '{"fixes_defect": bool, "breaks_valid_use": bool, "reason": str}.\n'
             f"Finding: {finding.title}\n{finding.explanation}\n"

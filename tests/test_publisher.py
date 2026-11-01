@@ -122,6 +122,81 @@ async def test_suggestion_preserves_indentation_and_trailing_code(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_style_suggestions_require_quality_opt_in(monkeypatch):
+    reviews = []
+
+    class FakeGitHubClient:
+        async def list_pull_request_comments(self, owner, repo, number):
+            return []
+
+        async def create_pull_request_review(self, *args):
+            reviews.append(args)
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(publisher, "GitHubClient", FakeGitHubClient)
+    finding = {
+        "line": 1,
+        "category": "bug",
+        "severity": "high",
+        "title": "Missing type hint",
+        "explanation": "Add a type hint for this parameter.",
+        "fix": {
+            "original": "def f(value):",
+            "replacement": "def f(value: int):",
+            "verified": True,
+            "critic_safe": True,
+        },
+    }
+    source = "def f(value):\n    return value\n"
+    patch = "@@ -1 +1 @@\n-def f(value):\n+def f(value: int):\n"
+
+    without_quality = await publisher.post_review(
+        "acme", "widgets", 8, "sha", "app.py", [finding], patch, source,
+        categories={"bug"},
+    )
+    assert without_quality == {
+        "published": False, "comments": 0, "summary_findings": 0
+    }
+    assert reviews == []
+
+    with_quality = await publisher.post_review(
+        "acme", "widgets", 9, "sha", "app.py", [finding], patch, source,
+        categories={"bug", "quality"},
+    )
+    assert with_quality["comments"] == 0
+    assert with_quality["summary_findings"] == 1
+    assert finding["category"] == "quality"
+    assert "```suggestion" not in reviews[0][-2]
+    assert "Missing type hint" in reviews[0][-2]
+
+
+@pytest.mark.asyncio
+async def test_review_notice_is_a_top_level_comment(monkeypatch):
+    reviews = []
+
+    class FakeGitHubClient:
+        async def create_pull_request_review(self, *args):
+            reviews.append(args)
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(publisher, "GitHubClient", FakeGitHubClient)
+
+    await publisher.post_review_notice(
+        "acme", "widgets", 11, "sha", ["first.py", "second.py"]
+    )
+
+    assert reviews[0][-1] == []
+    assert reviews[0][-2] == (
+        "Automated review could not complete for first.py\n"
+        "Automated review could not complete for second.py"
+    )
+
+
+@pytest.mark.asyncio
 async def test_multiline_suggestion_preserves_block_indentation_and_range(monkeypatch):
     comments = []
 

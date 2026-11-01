@@ -9,7 +9,7 @@ from app.context import build_file_context
 from app.deps import scan_dependencies
 from app.github_client import GitHubClient
 from app.graph import run_graph
-from app.publisher import post_reviews
+from app.publisher import post_review_notice, post_reviews
 from app.repo_index import create_repository_index
 from app.security import verify_signature
 
@@ -55,6 +55,7 @@ async def run_review(owner: str, repo: str, number: int) -> None:
     )
     gh = GitHubClient()
     review_items = []
+    failed_files = []
     repo_index = None
     if len(data["files"]) > 50:
         log.info("Skipping repository indexing for %s: %d changed files exceeds limit 50",
@@ -143,6 +144,7 @@ async def run_review(owner: str, repo: str, number: int) -> None:
                         res = await run_graph(f["filename"], src, ctx)
                     except Exception:
                         log.exception("Review graph failed for %s", f["filename"])
+                        failed_files.append(f["filename"])
                         continue
                     for x in res["findings"]:
                         log.info("    [%s/%s] line %d: %s (%s)", x.category, x.severity, x.line, x.title, x.source)
@@ -158,14 +160,30 @@ async def run_review(owner: str, repo: str, number: int) -> None:
                             "filename": f["filename"], "findings": res["findings"],
                             "patch": f["patch"], "source": src,
                         })
-            except (httpx.HTTPError, KeyError, ValueError):
+            except Exception:
+                failed_files.append(f["filename"])
                 log.exception("Could not review file %s", f["filename"])
                 continue
+        if failed_files:
+            try:
+                await post_review_notice(
+                    owner, repo, number, data["head_sha"], failed_files
+                )
+            except Exception:
+                log.exception(
+                    "Could not post review-failure notice for %s/%s#%d",
+                    owner, repo, number,
+                )
         if settings.publish_reviews and review_items:
             try:
                 await post_reviews(owner, repo, number, data["head_sha"], review_items)
-            except (httpx.HTTPError, KeyError, ValueError):
+            except Exception:
                 log.exception("Could not publish review for %s/%s#%d", owner, repo, number)
+                raise
+        if failed_files:
+            raise RuntimeError(
+                "Automated review could not complete for: " + ", ".join(failed_files)
+            )
     finally:
         await gh.aclose()
 

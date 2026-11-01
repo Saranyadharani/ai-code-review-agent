@@ -30,10 +30,36 @@ def _value(finding, key: str, default=None):
     return getattr(finding, key, default)
 
 
+def _set_value(finding, key: str, value) -> None:
+    if isinstance(finding, dict):
+        finding[key] = value
+    else:
+        setattr(finding, key, value)
+
+
 def _finding_marker(filename: str, finding) -> str:
     identity = f"{filename}\0{ensure_finding_id(finding)}"
     digest = hashlib.sha1(identity.encode("utf-8")).hexdigest()
     return f"<!-- review-agent:{digest} -->"
+
+
+async def post_review_notice(
+    owner: str,
+    repo: str,
+    number: int,
+    head_sha: str,
+    filenames: Sequence[str],
+) -> None:
+    """Post top-level notes for files whose automated review did not complete."""
+    body = "\n".join(
+        f"Automated review could not complete for {filename}"
+        for filename in filenames
+    )
+    gh = GitHubClient()
+    try:
+        await gh.create_pull_request_review(owner, repo, number, head_sha, body, [])
+    finally:
+        await gh.aclose()
 
 
 def _suggestion_details(finding, source: str) -> tuple[str | None, int | None, int | None]:
@@ -147,10 +173,12 @@ async def post_reviews(
             filename = file["filename"]
             for finding in deduplicate_findings(file["findings"]):
                 category = correct_category(finding)
+                style_only = is_style_only(finding) and category != "security"
+                if style_only and "quality" in allowed_categories:
+                    category = "quality"
+                    _set_value(finding, "category", category)
                 if (
-                    is_style_only(finding)
-                    and category != "security"
-                    and "quality" not in allowed_categories
+                    style_only and "quality" not in allowed_categories
                 ):
                     log.info(
                         "finding_dropped id=%s category=%s reason=style_noise",

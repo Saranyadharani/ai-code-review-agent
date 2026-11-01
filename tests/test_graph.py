@@ -1,14 +1,19 @@
 import logging
 import asyncio
+import re
 
 import pytest
 
-from app import graph, verify
+from app import graph, publisher, verify
+from app.context import parse_python
 
 
 @pytest.mark.asyncio
 async def test_new_nodes_use_matching_ruff_hints(monkeypatch):
     prompts = []
+    monkeypatch.setattr(
+        graph.settings, "review_categories", "security,bug,performance,quality"
+    )
 
     async def fake_ask_json(prompt):
         prompts.append(prompt)
@@ -52,6 +57,43 @@ async def test_new_nodes_use_matching_ruff_hints(monkeypatch):
     assert "late-binding closures" in prompts[2]
     assert "B023" in prompts[2] and "S307" not in prompts[2]
     assert "S307" in prompts[3] and "B023" not in prompts[3]
+
+
+@pytest.mark.asyncio
+async def test_quality_agent_skips_when_disabled_and_caps_per_function(monkeypatch, caplog):
+    calls = []
+
+    async def fake_ask_json(prompt):
+        calls.append(prompt)
+        return {"findings": [
+            {
+                "line": line, "severity": "medium", "title": f"Quality issue {line}",
+                "explanation": "Improve maintainability.",
+            }
+            for line in (2, 3, 4, 5)
+        ]}
+
+    monkeypatch.setattr(graph, "ask_json", fake_ask_json)
+    monkeypatch.setattr(graph.settings, "review_categories", "security,bug")
+    state = {
+        "filename": "sample.py",
+        "source": "def f():\n    a = 1\n    b = 2\n    c = 3\n    d = 4\n",
+        "ctx": {
+            "changed_functions": ["f"],
+            "functions": [{"name": "f", "start": 1, "end": 5}],
+            "ruff": [],
+        },
+    }
+
+    assert await graph.quality_node(state) == {"quality": []}
+    assert calls == []
+
+    monkeypatch.setattr(graph.settings, "review_categories", "security,bug,quality")
+    caplog.set_level(logging.INFO, logger="review-agent")
+    result = await graph.quality_node(state)
+    assert [finding.line for finding in result["quality"]] == [2, 3, 4]
+    assert "no more than 3 findings per function" in calls[0]
+    assert "reason=per_function_quality_cap:f" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -120,7 +162,7 @@ async def test_validate_logs_id_and_reason_for_every_noise_drop(monkeypatch, cap
 
     assert result["findings"] == []
     assert f"finding_dropped id={finding.id}" in caplog.text
-    assert "reason=low_severity_noise" in caplog.text
+    assert "reason=quality_not_enabled" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -291,10 +333,96 @@ async def test_fix_node_runs_behavior_critic(monkeypatch):
 
     assert "Preserve imports at the top" in prompts[0]
     assert "Does this fix correct the flagged defect WITHOUT breaking valid uses?" in prompts[1]
+    assert "Externalizing a hardcoded secret" in prompts[1]
+    assert "adding a required configuration input is allowed" in prompts[1]
     assert finding.id in prompts[1]
     assert finding.fix["critic_safe"] is False
     assert finding.critic_verdict["reason"] == "The replacement changes valid-input behavior."
     assert finding.suggestion == ""
+
+
+@pytest.mark.asyncio
+async def test_run_graph_end_to_end_with_only_llm_mocked(monkeypatch):
+    monkeypatch.setattr(
+        graph.settings, "review_categories", "security,bug,performance"
+    )
+    source = (
+        "import ast\n"
+        "import os\n"
+        "\n"
+        'API_KEY = "hardcoded"\n'
+        "\n"
+        "def parse(value):\n"
+        "    return eval(value)\n"
+        "\n"
+        "def run(command):\n"
+        "    os.system(command)\n"
+        "\n"
+        "def adjust(value):\n"
+        "    return value + 1\n"
+    )
+    findings = {
+        "security": [
+            {"line": 4, "severity": "high", "title": "Hardcoded secret", "explanation": "A credential is embedded in source."},
+            {"line": 7, "severity": "high", "title": "Unsafe evaluation", "explanation": "Untrusted input is evaluated."},
+            {"line": 10, "severity": "high", "title": "Command injection", "explanation": "Input reaches shell execution."},
+        ],
+        "bug": [{
+            "line": 13, "severity": "high", "title": "Off-by-one arithmetic",
+            "explanation": "The result is one less than expected.",
+        }],
+    }
+    prompts = []
+
+    async def fake_ask_json(prompt):
+        prompts.append(prompt)
+        if prompt.startswith("TASK: SECURITY."):
+            return {"findings": findings["security"]}
+        if prompt.startswith("TASK: BUGS."):
+            return {"bugs": findings["bug"]}
+        if prompt.startswith("TASK: PERFORMANCE."):
+            return {"findings": []}
+        if prompt.startswith("TASK: FIXES."):
+            match = re.search(
+                r"finding_id=([0-9a-f]+).*title=Off-by-one arithmetic", prompt
+            )
+            assert match
+            return {"fixes": [{
+                "finding_id": match.group(1),
+                "original": "return value + 1",
+                "replacement": "return value + 2",
+                "note": "Use the correct offset.",
+            }]}
+        if prompt.startswith("Finding id:"):
+            return {
+                "fixes_defect": True,
+                "breaks_valid_use": False,
+                "reason": "The corrected arithmetic preserves the contract.",
+            }
+        raise AssertionError(f"Unexpected LLM prompt: {prompt[:80]}")
+
+    monkeypatch.setattr(graph, "ask_json", fake_ask_json)
+    context = parse_python(source)
+    context.update({
+        "changed_functions": ["parse", "run", "adjust"],
+        "semgrep": [],
+        "ruff": [],
+        "related_code": {"callers": [], "text": "", "tests_changed": None},
+    })
+
+    result = await graph.run_graph("sample.py", source, context)
+
+    assert len(result["findings"]) == 4
+    assert result["verify"]["accepted"] == 1, [
+        finding.fix for finding in result["findings"]
+    ]
+    bug = next(item for item in result["findings"] if item.title == "Off-by-one arithmetic")
+    assert bug.fix["verified"] is True
+    assert bug.critic_verdict["fixes_defect"] is True
+    assert sum(prompt.startswith("TASK:") for prompt in prompts) == 4
+    assert any(prompt.startswith("Finding id:") for prompt in prompts)
+    for finding in result["findings"]:
+        publisher._finding_text(finding, include_suggestion=True, source=source)
 
 
 @pytest.mark.asyncio
