@@ -11,6 +11,11 @@ docker compose up --build
 
 API at http://localhost:8010 (docs at /docs).
 
+Architecture Diagram 
+
+<img width="6225" height="2913" alt="image" src="https://github.com/user-attachments/assets/8152675c-11d5-4f4a-be5e-72a20803fd78" />
+
+
 ## Milestone checks
 
 1. **Token works**: `curl localhost:8010/repos/OWNER/REPO/pulls` lists open PRs.
