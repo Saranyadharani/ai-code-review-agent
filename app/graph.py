@@ -398,7 +398,8 @@ async def fix_node(s: State):
         "never add imports inside a function or midway through executable module code. If an import cannot "
         "be safely placed with the existing top-level imports, provide advice only. "
         "Reply as JSON object with key \"fixes\" (a list); each item has finding_id, original "
-        "(the EXACT existing text to replace), replacement, and note (short advice if rejected). "
+        "(the EXACT existing text to replace), replacement, and note (a concise imperative "
+        "instruction about this finding only; never mention another finding or its fix). "
         "Never use list positions or indices.\nIssues:\n" + listing + "\n\n" + _header(s))
     findings_by_id = {ensure_finding_id(finding): finding for finding in todo}
     fixes_by_id = {}

@@ -165,11 +165,105 @@ async def test_style_suggestions_require_quality_opt_in(monkeypatch):
         "acme", "widgets", 9, "sha", "app.py", [finding], patch, source,
         categories={"bug", "quality"},
     )
-    assert with_quality["comments"] == 0
-    assert with_quality["summary_findings"] == 1
+    assert with_quality["comments"] == 1
+    assert with_quality["summary_findings"] == 0
     assert finding["category"] == "quality"
-    assert "```suggestion" not in reviews[0][-2]
-    assert "Missing type hint" in reviews[0][-2]
+    assert "```suggestion\ndef f(value: int):\n```" in reviews[0][-1][0]["body"]
+
+
+@pytest.mark.parametrize(
+    "note,expected",
+    [
+        ("Removed the unsafe call because input is untrusted.", "Remove the unsafe call because input is untrusted."),
+        ("Replaced the parser with a safe parser.", "Replace the parser with a safe parser."),
+        ("Used a configured secret instead of a literal.", "Use a configured secret instead of a literal."),
+    ],
+)
+def test_published_advice_rewrites_past_tense_notes(note, expected):
+    finding = {
+        "category": "security",
+        "severity": "high",
+        "title": "Unsafe operation",
+        "explanation": "The operation is unsafe.",
+        "fix": {"note": note, "verified": False},
+    }
+
+    text = publisher._finding_text(finding, False, "")
+
+    assert f"Advice: {expected}" in text
+    assert "Advice: Removed" not in text
+    assert "Advice: Replaced" not in text
+    assert "Advice: Used" not in text
+
+
+def test_published_advice_does_not_include_another_findings_fix():
+    first = {
+        "category": "security",
+        "severity": "high",
+        "title": "Unsafe evaluation",
+        "fix": {
+            "note": "Removed eval and replaced os.system(command) with subprocess.run(command, shell=False).",
+            "verified": False,
+        },
+    }
+    other = {
+        "category": "security",
+        "title": "Shell command injection",
+        "fix": {
+            "original": "os.system(command)",
+            "replacement": "subprocess.run(command, shell=False)",
+        },
+    }
+
+    text = publisher._finding_text(first, False, "", [other])
+
+    assert "subprocess.run" not in text
+    assert "os.system" not in text
+    assert "Advice: Use a finding-specific change to address Unsafe evaluation." in text
+
+
+@pytest.mark.asyncio
+async def test_accepted_fix_without_inline_suggestion_logs_reason(monkeypatch, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="app.publisher")
+    comments = []
+
+    class FakeGitHubClient:
+        async def list_pull_request_comments(self, owner, repo, number):
+            return []
+
+        async def create_pull_request_review(self, *args):
+            comments.extend(args[-1])
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(publisher, "GitHubClient", FakeGitHubClient)
+    finding = {
+        "line": 2,
+        "category": "bug",
+        "severity": "high",
+        "title": "Incorrect result",
+        "fix": {
+            "original": "return old_value\n    unchanged()",
+            "replacement": "return new_value\n    unchanged()",
+            "verified": True,
+            "critic_safe": True,
+            "note": "Replaced the incorrect return value.",
+        },
+    }
+
+    await publisher.post_review(
+        "acme", "widgets", 12, "sha", "app.py", [finding],
+        "@@ -2,2 +2,2 @@\n-return old_value\n+return new_value\n     unchanged()\n",
+        "def f():\n    return old_value\n    unchanged()\n",
+    )
+
+    assert "```suggestion\n    return new_value\n```" not in comments[0]["body"]
+    assert "suggestion_not_published id=" in caplog.text
+    assert "reason=replacement_range_not_in_diff" in caplog.text
+    assert "Advice: Replace the incorrect return value." in comments[0]["body"]
 
 
 @pytest.mark.asyncio
@@ -344,7 +438,7 @@ async def test_run_review_publishes_when_enabled(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_review_category_filter_and_quality_summary_only(monkeypatch):
+async def test_review_category_filter_and_quality_opt_in(monkeypatch):
     reviews = []
 
     class FakeGitHubClient:
@@ -391,11 +485,12 @@ async def test_review_category_filter_and_quality_summary_only(monkeypatch):
         categories={"security", "quality"},
     )
 
-    assert result == {"published": True, "comments": 1, "summary_findings": 2}
+    assert result == {"published": True, "comments": 2, "summary_findings": 1}
     body, comments = reviews[0][-2:]
-    assert len(comments) == 1
+    assert len(comments) == 2
     assert "```suggestion\nsafe()\n```" in comments[0]["body"]
-    assert "Opt-in quality" in body
+    assert "Opt-in quality" in comments[1]["body"]
+    assert "```suggestion\nbetter()\n```" in comments[1]["body"]
     assert "Low severity" in body
     assert "```suggestion" not in body
 

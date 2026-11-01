@@ -22,6 +22,18 @@ log = logging.getLogger(__name__)
 
 _publish_lock = asyncio.Lock()
 _MARKER_PATTERN = re.compile(r"<!-- review-agent:([a-f0-9]{40}) -->")
+_IMPERATIVE_VERBS = {
+    "added": "Add",
+    "changed": "Change",
+    "configured": "Configure",
+    "fixed": "Fix",
+    "introduced": "Introduce",
+    "moved": "Move",
+    "removed": "Remove",
+    "replaced": "Replace",
+    "updated": "Update",
+    "used": "Use",
+}
 
 
 def _value(finding, key: str, default=None):
@@ -35,6 +47,54 @@ def _set_value(finding, key: str, value) -> None:
         finding[key] = value
     else:
         setattr(finding, key, value)
+
+
+def _advice_note(finding, other_findings: Sequence[object]) -> str:
+    fix = _value(finding, "fix")
+    note = str(fix.get("note", "") if isinstance(fix, dict) else "").strip()
+    if not note:
+        return ""
+    other_terms = []
+    for other in other_findings:
+        if other is finding:
+            continue
+        other_title = str(_value(other, "title", "") or "").strip()
+        if other_title:
+            other_terms.append(other_title.casefold())
+        other_fix = _value(other, "fix")
+        if isinstance(other_fix, dict):
+            other_terms.extend(
+                str(other_fix.get(key) or "").strip().casefold()
+                for key in ("original", "replacement", "note")
+                if other_fix.get(key)
+            )
+    sentences = re.split(r"(?<=[.!?])\s+", note)
+    relevant = [
+        sentence.strip()
+        for sentence in sentences
+        if sentence.strip()
+        and not any(term in sentence.casefold() for term in other_terms)
+    ]
+    if not relevant:
+        title = str(_value(finding, "title", "this issue")).strip().rstrip(".")
+        return f"Use a finding-specific change to address {title}."
+    advice = " ".join(relevant)
+    first_word = re.match(r"^([A-Za-z]+)(\b.*)$", advice, re.DOTALL)
+    if first_word:
+        verb = first_word.group(1).casefold()
+        if verb in _IMPERATIVE_VERBS:
+            advice = _IMPERATIVE_VERBS[verb] + first_word.group(2)
+    if advice[:1].islower():
+        advice = advice[0].upper() + advice[1:]
+    first = advice.split(None, 1)[0].rstrip(":,").casefold()
+    if first not in {
+        "add", "change", "configure", "consider", "define", "ensure", "fix",
+        "handle", "keep", "move", "pass", "prefer", "remove", "replace",
+        "use", "update", "validate", "avoid", "check", "preserve", "wrap",
+    }:
+        title = str(_value(finding, "title", "this issue")).strip().rstrip(".")
+        return f"Use a finding-specific change to address {title}."
+    return advice
 
 
 def _finding_marker(filename: str, finding) -> str:
@@ -89,7 +149,12 @@ def _suggestion_details(finding, source: str) -> tuple[str | None, int | None, i
     return suggestion, start, start + n_old - 1
 
 
-def _finding_text(finding, include_suggestion: bool, source: str) -> str:
+def _finding_text(
+    finding,
+    include_suggestion: bool,
+    source: str,
+    other_findings: Sequence[object] = (),
+) -> str:
     severity = str(_value(finding, "severity", "medium")).upper()
     category = str(_value(finding, "category", "finding"))
     title = str(_value(finding, "title", "Review finding"))
@@ -102,8 +167,8 @@ def _finding_text(finding, include_suggestion: bool, source: str) -> str:
     suggestion, _, _ = _suggestion_details(finding, source)
     if suggestion and include_suggestion:
         text += f"\n\n```suggestion\n{suggestion}\n```"
-    elif isinstance(fix, dict) and fix.get("note"):
-        text += f"\n\nAdvice: {fix['note']}"
+    elif isinstance(fix, dict) and _advice_note(finding, other_findings):
+        text += f"\n\nAdvice: {_advice_note(finding, other_findings)}"
     elif isinstance(fix, dict) and fix.get("verified") is False:
         text += "\n\nAdvice: Revise the proposed change to preserve valid behavior."
     return text
@@ -171,7 +236,8 @@ async def post_reviews(
         seen = set(existing_markers)
         for file in files:
             filename = file["filename"]
-            for finding in deduplicate_findings(file["findings"]):
+            file_findings = deduplicate_findings(file["findings"])
+            for finding in file_findings:
                 category = correct_category(finding)
                 style_only = is_style_only(finding) and category != "security"
                 if style_only and "quality" in allowed_categories:
@@ -212,6 +278,7 @@ async def post_reviews(
                 pending.append((
                     filename, file.get("patch"), file.get("source", ""),
                     finding, marker,
+                    [other for other in file_findings if other is not finding],
                 ))
                 seen.add(marker_value)
 
@@ -221,9 +288,32 @@ async def post_reviews(
 
         inline = []
         summary = []
-        for filename, patch, source, finding, marker in pending:
+        for filename, patch, source, finding, marker, other_findings in pending:
             diff_lines = changed_lines(patch)
             suggestion, start_line, end_line = _suggestion_details(finding, source)
+            fix = _value(finding, "fix")
+            verdict = fix.get("critic_verdict") if isinstance(fix, dict) else None
+            critic_accepted = (
+                isinstance(verdict, dict)
+                and verdict.get("fixes_defect") is True
+                and verdict.get("breaks_valid_use") is False
+            ) or (
+                isinstance(fix, dict) and fix.get("critic_safe") is True
+            )
+            has_valid_suggestion_range = (
+                suggestion is not None
+                and isinstance(start_line, int)
+                and isinstance(end_line, int)
+            )
+            if critic_accepted and not has_valid_suggestion_range:
+                reason = "fix_not_verified" if fix.get("verified") is not True else (
+                    "critic_rejected" if fix.get("critic_safe") is not True else
+                    "replacement_not_locatable"
+                )
+                log.info(
+                    "suggestion_not_published id=%s reason=%s",
+                    ensure_finding_id(finding), reason,
+                )
             finding_line = _value(finding, "line")
             valid_suggestion_range = (
                 suggestion is not None
@@ -237,13 +327,18 @@ async def post_reviews(
             valid_range = valid_suggestion_range or valid_finding_line
             severity = str(_value(finding, "severity", "medium")).lower()
             category = _value(finding, "category", "")
-            if valid_range and severity in {"high", "medium"} and category != "quality":
+            if (
+                valid_range
+                and severity in {"high", "medium"}
+                and (category != "quality" or "quality" in allowed_categories)
+            ):
                 comment_start = start_line if valid_suggestion_range else finding_line
                 comment_end = end_line if valid_suggestion_range else finding_line
                 inline.append({
                     "filename": filename,
                     "source": source,
                     "finding": finding,
+                    "other_findings": other_findings,
                     "start_line": comment_start,
                     "end_line": comment_end,
                     "suggestion": suggestion if valid_suggestion_range else None,
@@ -258,7 +353,24 @@ async def post_reviews(
                     "include_suggestion": False,
                 })
             else:
-                summary.append((filename, finding, marker, source))
+                if critic_accepted and has_valid_suggestion_range:
+                    log.info(
+                        "suggestion_not_published id=%s reason=%s",
+                        ensure_finding_id(finding),
+                        "range_not_inline_eligible",
+                    )
+                summary.append((
+                    filename, finding, marker, source, other_findings
+                ))
+            if (
+                critic_accepted
+                and has_valid_suggestion_range
+                and not valid_suggestion_range
+            ):
+                log.info(
+                    "suggestion_not_published id=%s reason=replacement_range_not_in_diff",
+                    ensure_finding_id(finding),
+                )
 
         inline.sort(key=lambda item: (
             SEVERITY_PRIORITY.get(item["severity"], 99),
@@ -278,13 +390,22 @@ async def post_reviews(
                 item["include_suggestion"] = True
                 occupied.append(suggestion_range)
             elif item["finding_line"] in item["diff_lines"]:
+                log.info(
+                    "suggestion_not_published id=%s reason=overlapping_higher_ranked_suggestion",
+                    ensure_finding_id(item["finding"]),
+                )
                 item["start_line"] = item["finding_line"]
                 item["end_line"] = item["finding_line"]
             else:
+                log.info(
+                    "suggestion_not_published id=%s reason=overlap_not_commentable",
+                    ensure_finding_id(item["finding"]),
+                )
                 item["start_line"] = None
                 item["end_line"] = None
                 summary.append((
-                    item["filename"], item["finding"], item["marker"], item["source"]
+                    item["filename"], item["finding"], item["marker"], item["source"],
+                    item["other_findings"],
                 ))
 
         valid_inline = [
@@ -299,8 +420,17 @@ async def post_reviews(
         ))
         selected = inline[:limit]
         overflow = inline[limit:]
+        for item in overflow:
+            if item["suggestion"] is not None:
+                log.info(
+                    "suggestion_not_published id=%s reason=inline_comment_cap",
+                    ensure_finding_id(item["finding"]),
+                )
         summary.extend(
-            (item["filename"], item["finding"], item["marker"], item["source"])
+            (
+                item["filename"], item["finding"], item["marker"], item["source"],
+                item["other_findings"],
+            )
             for item in overflow
         )
 
@@ -316,6 +446,7 @@ async def post_reviews(
                         finding,
                         include_suggestion=item["include_suggestion"],
                         source=item["source"],
+                        other_findings=item["other_findings"],
                     )
                     + "\n\n" + item["marker"]
                 ),
@@ -330,9 +461,14 @@ async def post_reviews(
             body = "Findings in the review summary:\n\n"
             body += "\n\n".join(
                 f"- `{filename}:{_value(finding, 'line')}` — "
-                f"{_finding_text(finding, include_suggestion=False, source=source)} "
-                f"{marker}"
-                for filename, finding, marker, source in summary
+                + _finding_text(
+                    finding,
+                    include_suggestion=False,
+                    source=source,
+                    other_findings=other_findings,
+                )
+                + f" {marker}"
+                for filename, finding, marker, source, other_findings in summary
             )
 
         try:

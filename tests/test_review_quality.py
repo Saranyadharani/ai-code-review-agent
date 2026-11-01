@@ -237,14 +237,14 @@ async def test_sample_review_publishes_one_categorized_issue_without_duplicate_s
         categories={"security", "bug", "performance", "quality"},
     )
 
-    assert result["comments"] == (0 if category == "quality" else 1)
-    assert result["summary_findings"] == (2 if category == "quality" else 1)
+    assert result["comments"] == 1
+    assert result["summary_findings"] == 1
     body, comments = reviews[0][-2:]
     all_text = body + "\n" + "\n".join(comment["body"] for comment in comments)
     assert all_text.count(title) == 1
     assert all_text.count("Separate summary-only finding") == 1
     assert sum("```suggestion" in comment["body"] for comment in comments) <= 1
-    assert title not in body or category == "quality"
+    assert title not in body
     if filename == "model_utils.py":
         assert "```suggestion\npreds = np.argmax(p.predictions, axis=1)\n```" in comments[0]["body"]
     if filename in {"pickle_utils.py", "eval_utils.py"}:
