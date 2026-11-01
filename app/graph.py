@@ -7,11 +7,16 @@ from typing import Literal, TypedDict
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
 
+from app.config import settings
 from app.llm import ask_json
+from app.review_rules import (
+    category_for_rule,
+    correct_category,
+    deduplicate_findings,
+    find_text_occurrence,
+    is_style_only,
+)
 from app.verify import verify_fixes
-
-SEV = {"high": 0, "medium": 1, "low": 2}
-
 
 class Finding(BaseModel):
     line: int
@@ -21,6 +26,7 @@ class Finding(BaseModel):
     explanation: str = ""
     suggestion: str = ""
     source: str = "llm"  # llm | semgrep
+    rule_id: str | None = None
     fix: dict | None = None
 
 
@@ -52,7 +58,8 @@ def _build(data, key, category):
     for it in _items(data, key):
         try:
             out.append(Finding(category=category, **{k: it[k] for k in
-                       ("line", "severity", "title", "explanation", "suggestion") if k in it}))
+                       ("line", "severity", "title", "explanation", "suggestion",
+                        "rule_id", "source") if k in it}))
         except (ValueError, TypeError):
             pass
     return out
@@ -223,33 +230,20 @@ async def impact_node(s: State):
 
 
 async def validate_node(s: State):
-    """Merge LLM and static findings without duplicating matching diagnostics."""
-    merged = sorted(
+    """Correct categories and merge duplicate findings across agents and analyzers."""
+    merged = (
         s.get("bugs", []) + s.get("security", [])
-        + s.get("performance", []) + s.get("quality", []),
-        # Impact findings are diagnostic and are not passed to the fixer.
-        key=lambda f: SEV.get(f.severity, 3),
+        + s.get("performance", []) + s.get("quality", [])
+        + s.get("impact", [])
     )
-    impact_findings = [
-        finding for finding in s.get("impact", [])
-        if not any(
-            existing.category in {"bug", "security"}
-            and abs(existing.line - finding.line) <= 1
-            for existing in merged
-        )
-    ]
-    merged.extend(impact_findings)
-    kept: list[Finding] = []
-    for f in merged:
-        if not any(k.category == f.category and abs(k.line - f.line) <= 1 for k in kept):
-            kept.append(f)
     static_hints = [
         {
             "line": h["line"],
-            "category": "security",
+            "category": category_for_rule(h.get("rule"), "bug"),
             "title": h["message"],
             "severity": "high" if h["severity"] == "ERROR" else "medium",
             "source": "semgrep",
+            "rule_id": h.get("rule"),
         }
         for h in s["ctx"].get("semgrep", [])
     ]
@@ -260,6 +254,7 @@ async def validate_node(s: State):
             "title": h["message"],
             "severity": "medium",
             "source": "ruff",
+            "rule_id": h["rule"],
         }
         for h in s["ctx"].get("ruff", [])
     )
@@ -267,14 +262,29 @@ async def validate_node(s: State):
         if not any(
             finding.category == hint["category"]
             and abs(finding.line - hint["line"]) <= 2
-            for finding in kept
+            for finding in merged
         ):
-            kept.append(Finding(**hint))
-    return {"findings": sorted(kept, key=lambda f: f.line)}
+            merged.append(Finding(**hint))
+    allowed_categories = {
+        category.strip().lower()
+        for category in settings.review_categories.split(",")
+        if category.strip()
+    }
+    filtered = []
+    for finding in merged:
+        category = correct_category(finding)
+        if category in {"performance", "quality"} and finding.severity.lower() == "low":
+            if category not in allowed_categories:
+                continue
+        if is_style_only(finding) and "quality" not in allowed_categories:
+            continue
+        filtered.append(finding)
+    deduplicated = deduplicate_findings(filtered)
+    return {"findings": sorted(deduplicated, key=lambda finding: finding.line)}
 
 
 async def fix_node(s: State):
-    """Ask for a patch per finding, then check it: original text must exist and result must parse."""
+    """Ask for fixes and an independent behavior-preservation critique."""
     todo = [
         (i, f) for i, f in enumerate(s["findings"])
         if f.severity in ("high", "medium") and f.category != "impact"
@@ -283,7 +293,10 @@ async def fix_node(s: State):
         return {}
     listing = "\n".join(f"{i}: line {f.line}: {f.title}" for i, f in todo)
     data = await ask_json(
-        "TASK: FIXES. For each issue below propose a minimal fix. Reply as JSON object with key \"fixes\" "
+        "TASK: FIXES. For each issue below propose a minimal fix. Preserve imports at the top of the file; "
+        "never add imports inside a function or midway through executable module code. If an import cannot "
+        "be safely placed with the existing top-level imports, provide advice only. "
+        "Reply as JSON object with key \"fixes\" "
         "(a list); each item has index (int), original (the EXACT existing text to replace, copied from the "
         "source without line numbers), replacement (the new text).\nIssues:\n" + listing + "\n\n" + _header(s))
     for it in _items(data, "fixes"):
@@ -291,13 +304,30 @@ async def fix_node(s: State):
             f, orig, new = s["findings"][int(it["index"])], it["original"], it["replacement"]
         except (KeyError, ValueError, IndexError, TypeError):
             continue
-        if not isinstance(orig, str) or not isinstance(new, str) or orig not in s["source"]:
+        if not isinstance(orig, str) or not isinstance(new, str):
             continue
-        try:
-            ast.parse(s["source"].replace(orig, new, 1))
-        except SyntaxError:
+        occurrence = find_text_occurrence(s["source"], orig, f.line)
+        if occurrence is None:
             continue
-        f.fix = {"original": orig, "replacement": new}
+        critique = await ask_json(
+            "TASK: FIX CRITIC. Does this fix preserve behaviour for valid inputs? "
+            "Reply JSON {safe: bool, reason}. Evaluate the original and proposed code conservatively.\n"
+            f"Finding: {f.title}\n{f.explanation}\nOriginal:\n{orig}\nReplacement:\n{new}"
+        )
+        safe = isinstance(critique, dict) and critique.get("safe") is True
+        reason = (
+            str(critique.get("reason", "")).strip()
+            if isinstance(critique, dict) else ""
+        )
+        f.fix = {
+            "original": orig,
+            "replacement": new,
+            "start_line": occurrence[1],
+            "critic_safe": safe,
+            "critic_reason": reason or ("Critic rejected behavior preservation." if not safe else ""),
+        }
+        if not safe:
+            f.suggestion = reason or "The proposed fix could not be confirmed as behavior-preserving."
     return {}
 
 

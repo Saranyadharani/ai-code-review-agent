@@ -8,6 +8,14 @@ from collections.abc import Sequence
 from app.config import settings
 from app.context import changed_lines
 from app.github_client import GitHubClient
+from app.review_rules import (
+    CATEGORY_PRIORITY,
+    SEVERITY_PRIORITY,
+    correct_category,
+    deduplicate_findings,
+    find_text_occurrence,
+    is_style_only,
+)
 
 log = logging.getLogger(__name__)
 
@@ -29,7 +37,11 @@ def _finding_marker(filename: str, finding) -> str:
 
 def _suggestion_details(finding, source: str) -> tuple[str | None, int | None, int | None]:
     fix = _value(finding, "fix")
-    if not isinstance(fix, dict) or fix.get("verified") is not True:
+    if (
+        not isinstance(fix, dict)
+        or fix.get("verified") is not True
+        or fix.get("critic_safe") is not True
+    ):
         return None, None, None
 
     original = fix.get("original")
@@ -37,13 +49,14 @@ def _suggestion_details(finding, source: str) -> tuple[str | None, int | None, i
     if not isinstance(original, str) or not original or not isinstance(replacement, str):
         return None, None, None
 
-    offset = source.find(original)
-    if offset < 0:
+    occurrence = find_text_occurrence(
+        source, original, fix.get("start_line", _value(finding, "line"))
+    )
+    if occurrence is None:
         return None, None, None
-
-    start = source[:offset].count("\n") + 1
+    offset, start = occurrence
     n_old = original.count("\n") + 1
-    patched = source.replace(original, replacement, 1)
+    patched = source[:offset] + replacement + source[offset + len(original):]
     n_new = n_old + replacement.count("\n") - original.count("\n")
     suggestion = "\n".join(patched.splitlines()[start - 1:start - 1 + n_new])
     return suggestion, start, start + n_old - 1
@@ -59,15 +72,15 @@ def _finding_text(finding, include_suggestion: bool, source: str) -> str:
         text += f"\n\n{explanation}"
 
     fix = _value(finding, "fix")
-    if isinstance(fix, dict):
-        replacement = fix.get("replacement")
-        suggestion, _, _ = _suggestion_details(finding, source)
-        if suggestion and include_suggestion:
-            text += f"\n\n```suggestion\n{suggestion}\n```"
-        elif replacement:
-            text += f"\n\nProposed fix (not applied as an inline suggestion):\n{replacement.rstrip()}"
+    suggestion, _, _ = _suggestion_details(finding, source)
+    if suggestion and include_suggestion:
+        text += f"\n\n```suggestion\n{suggestion}\n```"
+    elif isinstance(fix, dict) and fix.get("verified") is False:
+        reason = fix.get("critic_reason") or "; ".join(fix.get("problems", []))
+        if reason:
+            text += f"\n\nAdvice: {reason}"
     elif _value(finding, "suggestion"):
-        text += f"\n\nSuggested fix: {_value(finding, 'suggestion')}"
+        text += f"\n\nAdvice: {_value(finding, 'suggestion')}"
     return text
 
 
@@ -105,7 +118,6 @@ async def post_reviews(
     categories: set[str] | None = None,
 ) -> dict:
     """Publish one PR review with a global inline-comment cap."""
-    scope = f"{owner}/{repo}#{number}:"
     allowed_categories = categories
     if allowed_categories is None:
         allowed_categories = {
@@ -134,7 +146,20 @@ async def post_reviews(
         seen = set(existing_markers)
         for file in files:
             filename = file["filename"]
-            for finding in file["findings"]:
+            for finding in deduplicate_findings(file["findings"]):
+                category = correct_category(finding)
+                if (
+                    is_style_only(finding)
+                    and category != "security"
+                    and "quality" not in allowed_categories
+                ):
+                    continue
+                if (
+                    category in {"performance", "quality"}
+                    and str(_value(finding, "severity", "medium")).lower() == "low"
+                    and category not in allowed_categories
+                ):
+                    continue
                 if _value(finding, "category", "") not in allowed_categories:
                     continue
                 marker = _finding_marker(filename, finding)
@@ -157,28 +182,80 @@ async def post_reviews(
             diff_lines = changed_lines(patch)
             suggestion, start_line, end_line = _suggestion_details(finding, source)
             finding_line = _value(finding, "line")
-            comment_start = start_line if suggestion is not None else finding_line
-            comment_end = end_line if suggestion is not None else finding_line
-            valid_range = (
-                isinstance(comment_start, int)
-                and isinstance(comment_end, int)
-                and all(line in diff_lines for line in range(comment_start, comment_end + 1))
+            valid_suggestion_range = (
+                suggestion is not None
+                and isinstance(start_line, int)
+                and isinstance(end_line, int)
+                and all(line in diff_lines for line in range(start_line, end_line + 1))
             )
+            valid_finding_line = (
+                isinstance(finding_line, int) and finding_line in diff_lines
+            )
+            valid_range = valid_suggestion_range or valid_finding_line
             severity = str(_value(finding, "severity", "medium")).lower()
             category = _value(finding, "category", "")
             if valid_range and severity in {"high", "medium"} and category != "quality":
-                inline.append((
-                    {"filename": filename, "source": source, "finding": finding,
-                     "start_line": comment_start, "end_line": comment_end,
-                     "marker": marker},
-                    severity,
-                ))
+                comment_start = start_line if valid_suggestion_range else finding_line
+                comment_end = end_line if valid_suggestion_range else finding_line
+                inline.append({
+                    "filename": filename,
+                    "source": source,
+                    "finding": finding,
+                    "start_line": comment_start,
+                    "end_line": comment_end,
+                    "suggestion": suggestion if valid_suggestion_range else None,
+                    "suggestion_range": (
+                        (start_line, end_line) if valid_suggestion_range else None
+                    ),
+                    "finding_line": finding_line,
+                    "diff_lines": diff_lines,
+                    "marker": marker,
+                    "severity": severity,
+                    "category": category,
+                    "include_suggestion": False,
+                })
             else:
                 summary.append((filename, finding, marker, source))
 
-        inline.sort(key=lambda item: 0 if item[1] == "high" else 1)
-        selected = [item[0] for item in inline[:limit]]
-        overflow = [item[0] for item in inline[limit:]]
+        inline.sort(key=lambda item: (
+            SEVERITY_PRIORITY.get(item["severity"], 99),
+            CATEGORY_PRIORITY.get(item["category"], 99),
+        ))
+        used_suggestion_ranges = {}
+        for item in inline:
+            suggestion_range = item["suggestion_range"]
+            if suggestion_range is None:
+                continue
+            occupied = used_suggestion_ranges.setdefault(item["filename"], [])
+            overlaps = any(
+                suggestion_range[0] <= end and start <= suggestion_range[1]
+                for start, end in occupied
+            )
+            if not overlaps:
+                item["include_suggestion"] = True
+                occupied.append(suggestion_range)
+            elif item["finding_line"] in item["diff_lines"]:
+                item["start_line"] = item["finding_line"]
+                item["end_line"] = item["finding_line"]
+            else:
+                item["start_line"] = None
+                item["end_line"] = None
+                summary.append((
+                    item["filename"], item["finding"], item["marker"], item["source"]
+                ))
+
+        valid_inline = [
+            item for item in inline
+            if isinstance(item["start_line"], int)
+            and isinstance(item["end_line"], int)
+        ]
+        inline = valid_inline
+        inline.sort(key=lambda item: (
+            SEVERITY_PRIORITY.get(item["severity"], 99),
+            CATEGORY_PRIORITY.get(item["category"], 99),
+        ))
+        selected = inline[:limit]
+        overflow = inline[limit:]
         summary.extend(
             (item["filename"], item["finding"], item["marker"], item["source"])
             for item in overflow
@@ -192,7 +269,11 @@ async def post_reviews(
                 "line": item["end_line"],
                 "side": "RIGHT",
                 "body": (
-                    _finding_text(finding, include_suggestion=True, source=item["source"])
+                    _finding_text(
+                        finding,
+                        include_suggestion=item["include_suggestion"],
+                        source=item["source"],
+                    )
                     + "\n\n" + item["marker"]
                 ),
             }

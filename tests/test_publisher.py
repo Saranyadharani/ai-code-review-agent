@@ -42,6 +42,7 @@ async def test_post_review_comments_only_on_changed_lines(monkeypatch):
                 "original": "return count",
                 "replacement": "return total",
                 "verified": True,
+                "critic_safe": True,
             },
         },
         {
@@ -64,7 +65,8 @@ async def test_post_review_comments_only_on_changed_lines(monkeypatch):
     owner, repo, number, sha, body, comments = clients[0].reviews[0]
     assert (owner, repo, number, sha) == ("acme", "widgets", 7, "abc123")
     assert body.startswith("Findings in the review summary")
-    assert "safe_call()" in body
+    assert "safe_call()" not in body
+    assert "```suggestion" not in body
     assert "```suggestion" not in body
     assert comments == [{
         "path": "src/app.py",
@@ -105,6 +107,7 @@ async def test_suggestion_preserves_indentation_and_trailing_code(monkeypatch):
             "original": "eval(x)",
             "replacement": "ast.literal_eval(x)",
             "verified": True,
+            "critic_safe": True,
         },
     }
 
@@ -149,6 +152,7 @@ async def test_multiline_suggestion_preserves_block_indentation_and_range(monkey
             "original": "first()\n        second()",
             "replacement": "first_new()\n        second_new()\n        third()",
             "verified": True,
+            "critic_safe": True,
         },
     }
 
@@ -283,19 +287,30 @@ async def test_review_category_filter_and_quality_summary_only(monkeypatch):
     findings = [
         {
             "line": 1, "category": "security", "severity": "high", "title": "Allowed",
-            "fix": {"original": "unsafe()", "replacement": "safe()", "verified": True},
+            "fix": {
+                "original": "unsafe()", "replacement": "safe()", "verified": True,
+                "critic_safe": True,
+            },
         },
         {
-            "line": 2, "category": "quality", "severity": "high", "title": "Opt-in quality",
-            "fix": {"original": "weak()", "replacement": "better()", "verified": True},
+            "line": 4, "category": "quality", "severity": "high", "title": "Opt-in quality",
+            "fix": {
+                "original": "weak()", "replacement": "better()", "verified": True,
+                "critic_safe": True,
+            },
         },
         {
-            "line": 3, "category": "security", "severity": "low", "title": "Low severity",
-            "fix": {"original": "minor()", "replacement": "improved()", "verified": True},
+            "line": 7, "category": "security", "severity": "low", "title": "Low severity",
+            "fix": {
+                "original": "minor()", "replacement": "improved()", "verified": True,
+                "critic_safe": True,
+            },
         },
     ]
-    source = "unsafe()\nweak()\nminor()\n"
-    patch = "@@ -0,0 +1,3 @@\n+unsafe()\n+weak()\n+minor()\n"
+    source = "unsafe()\n\n\nweak()\n\n\nminor()\n"
+    patch = (
+        "@@ -0,0 +1,7 @@\n+unsafe()\n+\n+\n+weak()\n+\n+\n+minor()\n"
+    )
 
     result = await publisher.post_review(
         "acme", "widgets", 10, "sha", "app.py", findings, patch, source,
@@ -335,12 +350,15 @@ async def test_max_inline_comments_selects_highest_severity_first(monkeypatch):
     monkeypatch.setattr(publisher, "GitHubClient", FakeGitHubClient)
     findings = [
         {"line": line, "category": "bug", "severity": "medium", "title": f"medium-{line}"}
-        for line in range(1, 5)
+        for line in (1, 4, 7, 10)
     ] + [
         {"line": line, "category": "security", "severity": "high", "title": f"high-{line}"}
-        for line in range(5, 9)
+        for line in (13, 16, 19, 22)
     ]
-    patch = "@@ -0,0 +1,8 @@\n" + "".join(f"+line {line}\n" for line in range(1, 9))
+    lines = [""] * 22
+    for finding in findings:
+        lines[finding["line"] - 1] = finding["title"]
+    patch = "@@ -0,0 +1,22 @@\n" + "".join(f"+{line}\n" for line in lines)
 
     result = await publisher.post_review(
         "acme", "widgets", 12, "sha", "app.py", findings, patch,
@@ -350,11 +368,62 @@ async def test_max_inline_comments_selects_highest_severity_first(monkeypatch):
     assert result == {"published": True, "comments": 3, "summary_findings": 5}
     _, comments = reviews[0][-2:]
     assert [comment["body"].splitlines()[0] for comment in comments] == [
-        "**HIGH / security: high-5**",
-        "**HIGH / security: high-6**",
-        "**HIGH / security: high-7**",
+        "**HIGH / security: high-13**",
+        "**HIGH / security: high-16**",
+        "**HIGH / security: high-19**",
     ]
     assert "medium-1" in reviews[0][-2]
+
+
+@pytest.mark.asyncio
+async def test_overlapping_suggestions_keep_only_highest_severity_block(monkeypatch):
+    reviews = []
+
+    class FakeGitHubClient:
+        async def create_pull_request_review(self, *args):
+            reviews.append(args)
+
+        async def list_pull_request_comments(self, owner, repo, number):
+            return []
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(publisher, "GitHubClient", FakeGitHubClient)
+    source = "def f():\n    first()\n    second()\n    third()\n"
+    findings = [
+        {
+            "line": 2, "category": "security", "severity": "high",
+            "title": "First range", "explanation": "First invocation returns the expected value.",
+            "fix": {
+                "original": "first()\n    second()",
+                "replacement": "first_safe()\n    second_safe()",
+                "verified": True, "critic_safe": True,
+            },
+        },
+        {
+            "line": 4, "category": "bug", "severity": "medium",
+            "title": "Second range", "explanation": "Second invocation can fail independently.",
+            "fix": {
+                "original": "second()\n    third()",
+                "replacement": "second_safe()\n    third_safe()",
+                "verified": True, "critic_safe": True,
+            },
+        },
+    ]
+
+    result = await publisher.post_review(
+        "acme", "widgets", 13, "sha", "app.py", findings,
+        "@@ -1,4 +1,4 @@\n def f():\n+    first()\n+    second()\n+    third()\n",
+        source,
+    )
+
+    assert result == {"published": True, "comments": 2, "summary_findings": 0}
+    body, comments = reviews[0][-2:]
+    assert sum("```suggestion" in comment["body"] for comment in comments) == 1
+    assert "```suggestion" in comments[0]["body"]
+    assert "```suggestion" not in comments[1]["body"]
+    assert "First range" not in body and "Second range" not in body
 
 
 @pytest.mark.asyncio

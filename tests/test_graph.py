@@ -42,6 +42,8 @@ async def test_new_nodes_use_matching_ruff_hints(monkeypatch):
 
     assert performance["performance"][0].category == "performance"
     assert quality["quality"][0].category == "quality"
+    assert bug["bugs"][0].category == "bug"
+    assert security["security"][0].category == "security"
     assert "PERF401" in prompts[0] and "D103" not in prompts[0]
     assert "D103" in prompts[1] and "PERF401" not in prompts[1]
     assert "late-binding closures" in prompts[2]
@@ -50,7 +52,10 @@ async def test_new_nodes_use_matching_ruff_hints(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_validate_deduplicates_static_hints_by_category_and_distance():
+async def test_validate_deduplicates_static_hints_by_category_and_distance(monkeypatch):
+    monkeypatch.setattr(
+        graph.settings, "review_categories", "security,bug,performance,quality"
+    )
     state = {
         "bugs": [],
         "security": [
@@ -62,8 +67,14 @@ async def test_validate_deduplicates_static_hints_by_category_and_distance():
         "quality": [],
         "ctx": {
             "semgrep": [
-                {"line": 12, "message": "Covered security hint", "severity": "ERROR"},
-                {"line": 30, "message": "Uncovered security hint", "severity": "WARNING"},
+                {
+                    "line": 12, "rule": "eval-use",
+                    "message": "Covered security hint", "severity": "ERROR",
+                },
+                {
+                    "line": 30, "rule": "eval-use",
+                    "message": "Uncovered security hint", "severity": "WARNING",
+                },
             ],
             "ruff": [
                 {"line": 22, "rule": "PERF401", "message": "Covered performance hint", "category": "performance"},
@@ -171,6 +182,46 @@ async def test_impact_node_returns_empty_when_changed_function_has_no_callers(mo
     result = await graph.impact_node(state)
 
     assert result == {"impact": []}
+
+
+@pytest.mark.asyncio
+async def test_fix_node_runs_behavior_critic(monkeypatch):
+    prompts = []
+    responses = iter([
+        {
+            "fixes": [{
+                "index": 0,
+                "original": "unsafe(value)",
+                "replacement": "safe(value)",
+            }]
+        },
+        {"safe": False, "reason": "The replacement changes valid-input behavior."},
+    ])
+
+    async def fake_ask_json(prompt):
+        prompts.append(prompt)
+        return next(responses)
+
+    monkeypatch.setattr(graph, "ask_json", fake_ask_json)
+    finding = graph.Finding(
+        line=2, category="bug", severity="high", title="Unsafe operation"
+    )
+    state = {
+        "filename": "sample.py",
+        "source": "def f(value):\n    return unsafe(value)\n",
+        "ctx": {
+            "changed_functions": ["f"],
+            "functions": [{"name": "f", "start": 1, "end": 2}],
+        },
+        "findings": [finding],
+    }
+
+    await graph.fix_node(state)
+
+    assert "Preserve imports at the top" in prompts[0]
+    assert "Does this fix preserve behaviour for valid inputs?" in prompts[1]
+    assert finding.fix["critic_safe"] is False
+    assert finding.suggestion == "The replacement changes valid-input behavior."
 
 
 def test_header_includes_imports_and_only_changed_functions():
