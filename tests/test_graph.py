@@ -1,6 +1,9 @@
+import logging
+import asyncio
+
 import pytest
 
-from app import graph
+from app import graph, verify
 
 
 @pytest.mark.asyncio
@@ -91,6 +94,69 @@ async def test_validate_deduplicates_static_hints_by_category_and_distance(monke
         ("security", 30),
         ("bug", 40),
     ]
+
+
+@pytest.mark.asyncio
+async def test_validate_logs_id_and_reason_for_every_noise_drop(monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger="review-agent")
+    monkeypatch.setattr(
+        graph.settings, "review_categories", "security,bug,performance,dependency"
+    )
+    finding = graph.Finding(
+        line=3,
+        category="quality",
+        severity="low",
+        title="Potential quality improvement",
+    )
+
+    result = await graph.validate_node({
+        "bugs": [],
+        "security": [],
+        "performance": [],
+        "quality": [finding],
+        "impact": [],
+        "ctx": {"semgrep": [], "ruff": []},
+    })
+
+    assert result["findings"] == []
+    assert f"finding_dropped id={finding.id}" in caplog.text
+    assert "reason=low_severity_noise" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_every_input_finding_is_retained_or_logged_as_dropped(monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger="review-agent")
+    monkeypatch.setattr(
+        graph.settings, "review_categories", "security,bug,performance,dependency"
+    )
+    findings = [
+        graph.Finding(line=4, category="bug", title="Unsafe input handling"),
+        graph.Finding(
+            line=4, category="security", title="Unsafe input handling",
+            rule_id="sql-fstring",
+        ),
+        graph.Finding(
+            line=40, category="quality", severity="low",
+            title="Potential quality improvement",
+        ),
+    ]
+
+    result = await graph.validate_node({
+        "bugs": [findings[0]],
+        "security": [findings[1]],
+        "performance": [],
+        "quality": [findings[2]],
+        "impact": [],
+        "ctx": {"semgrep": [], "ruff": []},
+    })
+
+    retained_ids = {finding.id for finding in result["findings"]}
+    dropped_ids = {
+        finding.id for finding in findings
+        if f"finding_dropped id={finding.id}" in caplog.text
+    }
+    assert retained_ids | dropped_ids == {finding.id for finding in findings}
+    assert retained_ids & dropped_ids == set()
 
 
 @pytest.mark.asyncio
@@ -187,15 +253,23 @@ async def test_impact_node_returns_empty_when_changed_function_has_no_callers(mo
 @pytest.mark.asyncio
 async def test_fix_node_runs_behavior_critic(monkeypatch):
     prompts = []
+    finding = graph.Finding(
+        line=2, category="bug", severity="high", title="Unsafe operation"
+    )
     responses = iter([
         {
             "fixes": [{
-                "index": 0,
+                "finding_id": finding.id,
                 "original": "unsafe(value)",
                 "replacement": "safe(value)",
+                "note": "Use a behavior-preserving replacement.",
             }]
         },
-        {"safe": False, "reason": "The replacement changes valid-input behavior."},
+        {
+            "fixes_defect": True,
+            "breaks_valid_use": True,
+            "reason": "The replacement changes valid-input behavior.",
+        },
     ])
 
     async def fake_ask_json(prompt):
@@ -203,9 +277,6 @@ async def test_fix_node_runs_behavior_critic(monkeypatch):
         return next(responses)
 
     monkeypatch.setattr(graph, "ask_json", fake_ask_json)
-    finding = graph.Finding(
-        line=2, category="bug", severity="high", title="Unsafe operation"
-    )
     state = {
         "filename": "sample.py",
         "source": "def f(value):\n    return unsafe(value)\n",
@@ -219,9 +290,167 @@ async def test_fix_node_runs_behavior_critic(monkeypatch):
     await graph.fix_node(state)
 
     assert "Preserve imports at the top" in prompts[0]
-    assert "Does this fix preserve behaviour for valid inputs?" in prompts[1]
+    assert "Does this fix correct the flagged defect WITHOUT breaking valid uses?" in prompts[1]
+    assert finding.id in prompts[1]
     assert finding.fix["critic_safe"] is False
-    assert finding.suggestion == "The replacement changes valid-input behavior."
+    assert finding.critic_verdict["reason"] == "The replacement changes valid-input behavior."
+    assert finding.suggestion == ""
+
+
+@pytest.mark.asyncio
+async def test_fix_and_critic_verdicts_follow_finding_ids_after_reordering(monkeypatch):
+    findings = [
+        graph.Finding(line=2, category="bug", severity="high", title="First issue"),
+        graph.Finding(line=3, category="bug", severity="high", title="Second issue"),
+    ]
+    verdicts = {
+        findings[0].id: {"fixes_defect": True, "breaks_valid_use": False, "reason": "first"},
+        findings[1].id: {"fixes_defect": False, "breaks_valid_use": False, "reason": "second"},
+    }
+
+    async def fake_ask_json(prompt):
+        if "TASK: FIXES." in prompt:
+            return {"fixes": [
+                {
+                    "finding_id": findings[1].id,
+                    "original": "second()",
+                    "replacement": "second_safe()",
+                },
+                {
+                    "finding_id": findings[0].id,
+                    "original": "first()",
+                    "replacement": "first_safe()",
+                },
+            ]}
+        finding_id = next(identity for identity in verdicts if identity in prompt)
+        return verdicts[finding_id]
+
+    monkeypatch.setattr(graph, "ask_json", fake_ask_json)
+    await graph.fix_node({
+        "filename": "sample.py",
+        "source": "def f():\n    first()\n    second()\n",
+        "ctx": {"changed_functions": ["f"], "functions": [{"name": "f", "start": 1, "end": 3}]},
+        "findings": findings,
+    })
+
+    assert findings[0].fix["original"] == "first()"
+    assert findings[1].fix["original"] == "second()"
+    assert findings[0].critic_verdict["reason"] == "first"
+    assert findings[1].critic_verdict["reason"] == "second"
+    assert findings[0].fix["critic_safe"] is True
+    assert findings[1].fix["critic_safe"] is False
+
+
+@pytest.mark.asyncio
+async def test_critic_parse_failure_retries_then_uses_deterministic_guards(monkeypatch):
+    finding = graph.Finding(
+        line=2, category="bug", severity="high", title="Incorrect increment"
+    )
+    calls = 0
+
+    async def fake_ask_json(prompt):
+        nonlocal calls
+        calls += 1
+        if "TASK: FIXES." in prompt:
+            return {"fixes": [{
+                "finding_id": finding.id,
+                "original": "return value + 1",
+                "replacement": "return value + 2",
+                "note": "Adjust the increment.",
+            }]}
+        return {"safe": True, "reason": "legacy malformed verdict"}
+
+    monkeypatch.setattr(graph, "ask_json", fake_ask_json)
+    monkeypatch.setattr(graph, "CRITIC_TIMEOUT_SECONDS", 1)
+    await graph.fix_node({
+        "filename": "sample.py",
+        "source": "def increment(value):\n    return value + 1\n",
+        "ctx": {"changed_functions": ["increment"], "functions": [{"name": "increment", "start": 1, "end": 2}]},
+        "findings": [finding],
+    })
+
+    monkeypatch.setattr(verify, "run_semgrep", lambda source: [])
+    result = await verify.verify_fixes(
+        "def increment(value):\n    return value + 1\n", [finding]
+    )
+    assert calls == 3
+    assert finding.critic_verdict is None
+    assert finding.fix["critic_failure"] == "critic returned an invalid verdict shape"
+    assert result["accepted"] == 1
+
+
+@pytest.mark.asyncio
+async def test_critic_timeout_retries_then_uses_deterministic_guards(monkeypatch):
+    finding = graph.Finding(
+        line=2, category="bug", severity="high", title="Incorrect increment"
+    )
+    calls = 0
+
+    async def fake_ask_json(prompt):
+        nonlocal calls
+        if "TASK: FIXES." in prompt:
+            return {"fixes": [{
+                "finding_id": finding.id,
+                "original": "return value + 1",
+                "replacement": "return value + 2",
+            }]}
+        calls += 1
+        await asyncio.sleep(0.02)
+
+    monkeypatch.setattr(graph, "ask_json", fake_ask_json)
+    monkeypatch.setattr(graph, "CRITIC_TIMEOUT_SECONDS", 0.001)
+    await graph.fix_node({
+        "filename": "sample.py",
+        "source": "def increment(value):\n    return value + 1\n",
+        "ctx": {"changed_functions": ["increment"], "functions": [{"name": "increment", "start": 1, "end": 2}]},
+        "findings": [finding],
+    })
+
+    monkeypatch.setattr(verify, "run_semgrep", lambda source: [])
+    result = await verify.verify_fixes(
+        "def increment(value):\n    return value + 1\n", [finding]
+    )
+    assert calls == 2
+    assert finding.fix["critic_failure"] == "critic timed out"
+    assert result["accepted"] == 1
+
+
+@pytest.mark.asyncio
+async def test_base_version_revert_skips_critic_and_is_verified(monkeypatch):
+    calls = []
+
+    async def fake_ask_json(prompt):
+        calls.append(prompt)
+        return {"fixes": [{
+            "finding_id": finding.id,
+            "original": "return value - 1",
+            "replacement": "return value + 1",
+        }]}
+
+    finding = graph.Finding(
+        line=2, category="bug", severity="high", title="Incorrect arithmetic"
+    )
+    monkeypatch.setattr(graph, "ask_json", fake_ask_json)
+    source = "def calculate(value):\n    return value - 1\n"
+    diff = "@@ -2 +2 @@\n-    return value + 1\n+    return value - 1\n"
+    await graph.fix_node({
+        "filename": "sample.py",
+        "source": source,
+        "ctx": {
+            "changed_functions": ["calculate"],
+            "functions": [{"name": "calculate", "start": 1, "end": 2}],
+            "base_source": "def calculate(value):\n    return value + 1\n",
+            "unified_diff": diff,
+        },
+        "findings": [finding],
+    })
+
+    monkeypatch.setattr(verify, "run_semgrep", lambda source: [])
+    result = await verify.verify_fixes(source, [finding])
+    assert len(calls) == 1
+    assert finding.fix["base_revert"] is True
+    assert finding.critic_verdict["source"] == "base-revert"
+    assert result["accepted"] == 1
 
 
 def test_header_includes_imports_and_only_changed_functions():

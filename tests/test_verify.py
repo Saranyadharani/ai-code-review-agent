@@ -125,6 +125,52 @@ async def test_signature_change_is_allowed_for_signature_finding(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_return_shape_guard_allows_a_finding_about_return_shape(monkeypatch):
+    monkeypatch.setattr(verify, "run_semgrep", lambda source: [])
+    finding = {
+        "line": 2,
+        "title": "Return shape is incorrect",
+        "explanation": "The caller requires a tuple-shaped result.",
+        "fix": {
+            "original": "return [value]",
+            "replacement": "return (value,)",
+            "critic_safe": True,
+        },
+    }
+
+    result = await verify.verify_fixes(
+        "def result(value):\n    return [value]\n", [finding]
+    )
+
+    assert result["accepted"] == 1
+    assert finding["fix"]["verified"] is True
+
+
+@pytest.mark.asyncio
+async def test_explicit_critic_rejection_blocks_deterministically_valid_fix(monkeypatch):
+    monkeypatch.setattr(verify, "run_semgrep", lambda source: [])
+    finding = {
+        "line": 2,
+        "category": "bug",
+        "title": "Incorrect increment",
+        "fix": {
+            "original": "return value + 1",
+            "replacement": "return value + 2",
+            "critic_safe": False,
+            "critic_reason": "Private critic rationale",
+        },
+    }
+
+    result = await verify.verify_fixes(
+        "def increment(value):\n    return value + 1\n", [finding]
+    )
+
+    assert result["accepted"] == 0
+    assert finding["fix"]["verified"] is False
+    assert "Private critic rationale" not in str(finding["fix"]["problems"])
+
+
+@pytest.mark.asyncio
 async def test_fix_with_new_undefined_name_is_rejected(monkeypatch):
     monkeypatch.setattr(verify, "run_semgrep", lambda source: [])
     finding = {

@@ -13,6 +13,7 @@ from app.review_rules import (
     SEVERITY_PRIORITY,
     correct_category,
     deduplicate_findings,
+    ensure_finding_id,
     find_text_occurrence,
     is_style_only,
 )
@@ -30,7 +31,7 @@ def _value(finding, key: str, default=None):
 
 
 def _finding_marker(filename: str, finding) -> str:
-    identity = f"{filename}{_value(finding, 'line', '')}{_value(finding, 'title', '')}"
+    identity = f"{filename}\0{ensure_finding_id(finding)}"
     digest = hashlib.sha1(identity.encode("utf-8")).hexdigest()
     return f"<!-- review-agent:{digest} -->"
 
@@ -75,12 +76,10 @@ def _finding_text(finding, include_suggestion: bool, source: str) -> str:
     suggestion, _, _ = _suggestion_details(finding, source)
     if suggestion and include_suggestion:
         text += f"\n\n```suggestion\n{suggestion}\n```"
+    elif isinstance(fix, dict) and fix.get("note"):
+        text += f"\n\nAdvice: {fix['note']}"
     elif isinstance(fix, dict) and fix.get("verified") is False:
-        reason = fix.get("critic_reason") or "; ".join(fix.get("problems", []))
-        if reason:
-            text += f"\n\nAdvice: {reason}"
-    elif _value(finding, "suggestion"):
-        text += f"\n\nAdvice: {_value(finding, 'suggestion')}"
+        text += "\n\nAdvice: Revise the proposed change to preserve valid behavior."
     return text
 
 
@@ -153,18 +152,34 @@ async def post_reviews(
                     and category != "security"
                     and "quality" not in allowed_categories
                 ):
+                    log.info(
+                        "finding_dropped id=%s category=%s reason=style_noise",
+                        ensure_finding_id(finding), category,
+                    )
                     continue
                 if (
                     category in {"performance", "quality"}
                     and str(_value(finding, "severity", "medium")).lower() == "low"
                     and category not in allowed_categories
                 ):
+                    log.info(
+                        "finding_dropped id=%s category=%s reason=low_severity_noise",
+                        ensure_finding_id(finding), category,
+                    )
                     continue
                 if _value(finding, "category", "") not in allowed_categories:
+                    log.info(
+                        "finding_dropped id=%s category=%s reason=category_filter",
+                        ensure_finding_id(finding), category,
+                    )
                     continue
                 marker = _finding_marker(filename, finding)
                 marker_value = marker.removeprefix("<!-- review-agent:").removesuffix(" -->")
                 if marker_value in seen:
+                    log.info(
+                        "finding_dropped id=%s category=%s reason=already_published",
+                        ensure_finding_id(finding), category,
+                    )
                     continue
                 pending.append((
                     filename, file.get("patch"), file.get("source", ""),

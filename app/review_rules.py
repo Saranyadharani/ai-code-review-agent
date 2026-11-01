@@ -1,5 +1,9 @@
 """Configurable finding classification, ranking, deduplication, and noise rules."""
+import logging
+import hashlib
 import re
+
+from pydantic import BaseModel
 
 CATEGORY_PRIORITY = {
     "security": 0,
@@ -73,6 +77,17 @@ _SECURITY_RULE_PATTERNS = tuple(
 _STYLE_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in STYLE_ONLY_KEYWORDS)
 _WORD_PATTERN = re.compile(r"[a-z0-9_]+", re.IGNORECASE)
 _SECURITY_RULE_IDS_NORMALIZED = {rule.upper() for rule in SECURITY_RULE_IDS}
+_CONTRACT_CONCERNS = {
+    "signature": re.compile(
+        r"\b(?:public )?signature\b|\bparameter list\b|\bargument list\b", re.I
+    ),
+    "return_shape": re.compile(
+        r"\b(?:return|result|output)\b.{0,30}\b(?:type|shape|format|semantics?)\b"
+        r"|\b(?:type|shape|format|semantics?)\b.{0,30}\b(?:return|result|output)\b",
+        re.I,
+    ),
+}
+log = logging.getLogger("review-agent")
 
 
 def category_for_rule(rule_id: str | None, fallback: str = "bug") -> str:
@@ -90,6 +105,35 @@ def finding_value(finding, key: str, default=None):
     if isinstance(finding, dict):
         return finding.get(key, default)
     return getattr(finding, key, default)
+
+
+def ensure_finding_id(finding) -> str:
+    value = finding_value(finding, "id")
+    if isinstance(value, str) and value.strip():
+        return value
+    identity_data = "\0".join(
+        str(finding_value(finding, key, "") or "")
+        for key in ("category", "line", "rule_id", "title", "explanation")
+    )
+    identity = hashlib.sha256(identity_data.encode("utf-8")).hexdigest()[:24]
+    if isinstance(finding, dict):
+        finding["id"] = identity
+    elif isinstance(finding, BaseModel):
+        object.__setattr__(finding, "id", identity)
+    else:
+        setattr(finding, "id", identity)
+    return identity
+
+
+def finding_concerns(finding, concern: str) -> bool:
+    pattern = _CONTRACT_CONCERNS.get(concern)
+    if pattern is None:
+        return False
+    text = " ".join(
+        str(finding_value(finding, key, "") or "")
+        for key in ("title", "explanation")
+    )
+    return pattern.search(text) is not None
 
 
 def finding_rule_id(finding) -> str:
@@ -217,13 +261,20 @@ def _set_fix(finding, fix) -> None:
 
 def _merge_best_fix(winner, duplicate) -> None:
     if _fix_rank(duplicate) > _fix_rank(winner):
-        _set_fix(winner, finding_value(duplicate, "fix"))
+        fix = dict(finding_value(duplicate, "fix"))
+        fix["finding_id"] = ensure_finding_id(winner)
+        _set_fix(winner, fix)
+        if isinstance(winner, BaseModel):
+            winner.critic_verdict = finding_value(duplicate, "critic_verdict")
+        elif isinstance(winner, dict):
+            winner["critic_verdict"] = finding_value(duplicate, "critic_verdict")
 
 
 def deduplicate_findings(findings):
     """Keep the highest-ranked finding for each issue while retaining its best fix."""
     for finding in findings:
         correct_category(finding)
+        ensure_finding_id(finding)
     parents = list(range(len(findings)))
 
     def root(index):
@@ -249,5 +300,11 @@ def deduplicate_findings(findings):
         winner = ranked[0]
         for duplicate in ranked[1:]:
             _merge_best_fix(winner, duplicate)
+            log.info(
+                "finding_dropped id=%s category=%s reason=deduplicated_into:%s",
+                ensure_finding_id(duplicate),
+                finding_value(duplicate, "category", ""),
+                ensure_finding_id(winner),
+            )
         winners.append(winner)
     return sorted(winners, key=_rank)

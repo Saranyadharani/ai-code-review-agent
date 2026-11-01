@@ -2,6 +2,7 @@
 import ast
 import asyncio
 import io
+import logging
 import re
 from collections import Counter
 
@@ -9,7 +10,9 @@ from pyflakes.api import check
 from pyflakes.reporter import Reporter
 
 from app.context import run_semgrep
-from app.review_rules import find_text_occurrence
+from app.review_rules import ensure_finding_id, find_text_occurrence, finding_concerns
+
+log = logging.getLogger("review-agent")
 
 
 def _finding_value(finding, key: str, default=""):
@@ -216,23 +219,16 @@ def _fix_problems(source: str, patched: str, finding, fix: dict) -> list[str]:
     if new_names:
         problems.append("Introduces undefined names: " + ", ".join(sorted(new_names)))
 
-    signature_issue = re.compile(
-        r"\b(?:signature|parameters?|arguments?)\b.{0,30}"
-        r"\b(?:change|changed|changing|mismatch|incorrect|missing|extra|breaking|update)\b"
-        r"|\b(?:change|changed|changing|mismatch|incorrect|missing|extra|breaking|update)\b"
-        r".{0,30}\b(?:signature|parameters?|arguments?)\b",
-        re.IGNORECASE,
-    )
-    about_signature = signature_issue.search(
-        " ".join(
-            str(_finding_value(finding, key, "") or "")
-            for key in ("title", "explanation")
-        )
-    ) is not None
-    if not about_signature and _function_signatures(source) != _function_signatures(patched):
+    if not fix.get("base_revert") and (
+        not finding_concerns(finding, "signature")
+        and _function_signatures(source) != _function_signatures(patched)
+    ):
         problems.append("Changes a function signature.")
 
-    if _return_shapes(source) != _return_shapes(patched):
+    if not fix.get("base_revert") and (
+        not finding_concerns(finding, "return_shape")
+        and _return_shapes(source) != _return_shapes(patched)
+    ):
         problems.append("Changes a function return type or shape.")
 
     original_expr = _fragment_expression(fix["original"])
@@ -261,9 +257,79 @@ def _fix_problems(source: str, patched: str, finding, fix: dict) -> list[str]:
 
     if not _imports_are_at_top(source, patched):
         problems.append("New imports must be placed with the top-level imports.")
-    if fix.get("critic_safe") is not True:
-        problems.append(fix.get("critic_reason") or "Behavior preservation was not confirmed.")
+    if fix.get("critic_safe") is False:
+        problems.append("The critic rejected this fix as unsafe for valid uses.")
     return problems
+
+
+def is_base_version_revert(
+    source: str,
+    base_source: str | None,
+    unified_diff: str,
+    finding,
+    original: str,
+    replacement: str,
+) -> bool:
+    """Return true when a fix restores the base text for a PR-modified line."""
+    if base_source is None or not unified_diff or not replacement:
+        return False
+    occurrence = find_text_occurrence(
+        source, original, _finding_value(finding, "line", None)
+    )
+    if occurrence is None:
+        return False
+    offset, start_line = occurrence
+    patched = source[:offset] + replacement + source[offset + len(original):]
+    patched_lines = patched.splitlines()
+    base_lines = base_source.splitlines()
+
+    hunk_pattern = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+    old_line = new_line = 0
+    block_old_start = block_new_start = 0
+    deleted: list[str] = []
+    added: list[str] = []
+
+    def matches_block() -> bool:
+        if not added or not deleted or not (
+            block_new_start <= start_line < block_new_start + len(added)
+        ):
+            return False
+        head_index, base_index = block_new_start - 1, block_old_start - 1
+        return (
+            patched_lines[head_index:head_index + len(added)] == deleted
+            and base_lines[base_index:base_index + len(deleted)] == deleted
+        )
+
+    for line in unified_diff.splitlines():
+        match = hunk_pattern.match(line)
+        if match:
+            if matches_block():
+                return True
+            old_line = int(match.group(1))
+            new_line = int(match.group(3))
+            deleted = []
+            added = []
+            block_new_start = new_line
+        elif line.startswith("\\"):
+            continue
+        elif line.startswith("-"):
+            if not deleted and not added:
+                block_old_start, block_new_start = old_line, new_line
+            deleted.append(line[1:])
+            old_line += 1
+        elif line.startswith("+"):
+            if not deleted and not added:
+                block_old_start, block_new_start = old_line, new_line
+            added.append(line[1:])
+            new_line += 1
+        else:
+            if matches_block():
+                return True
+            deleted = []
+            added = []
+            old_line += 1
+            new_line += 1
+    return matches_block()
 
 
 def _finding_fix(finding):
@@ -281,18 +347,34 @@ async def verify_fixes(source: str, findings: list) -> dict:
     """Verify each proposed fix, then check all accepted fixes together."""
     accepted = []
     for finding in findings:
+        finding_id = ensure_finding_id(finding)
         fix = _finding_fix(finding)
         if not isinstance(fix, dict):
+            log.info(
+                "finding_decision id=%s category=%s decision=rejected source=verify "
+                "reason=no-fix",
+                finding_id, _finding_value(finding, "category", ""),
+            )
             continue
         original, replacement = fix.get("original"), fix.get("replacement")
         if not isinstance(original, str) or not original or not isinstance(replacement, str):
             _set_verified(finding, fix, False, ["Fix must include exact original and replacement text."])
+            log.info(
+                "finding_decision id=%s category=%s decision=rejected source=verify "
+                "reason=invalid-fix-shape",
+                finding_id, _finding_value(finding, "category", ""),
+            )
             continue
         occurrence = find_text_occurrence(
             source, original, fix.get("start_line", _finding_value(finding, "line", None))
         )
         if occurrence is None:
             _set_verified(finding, fix, False, ["Original text was not found in the source."])
+            log.info(
+                "finding_decision id=%s category=%s decision=rejected source=verify "
+                "reason=original-text-not-found",
+                finding_id, _finding_value(finding, "category", ""),
+            )
             continue
         offset, start_line = occurrence
         fix["start_line"] = start_line
@@ -301,6 +383,13 @@ async def verify_fixes(source: str, findings: list) -> dict:
         _set_verified(finding, fix, not problems, problems)
         if not problems:
             accepted.append((finding, fix))
+        log.info(
+            "finding_decision id=%s category=%s decision=%s source=deterministic-guards%s",
+            finding_id,
+            _finding_value(finding, "category", ""),
+            "accepted" if not problems else "rejected",
+            "" if not problems else " reason=" + "; ".join(problems),
+        )
 
     if not accepted:
         return {"semgrep_before": 0, "semgrep_after": 0, "accepted": 0}
@@ -322,12 +411,24 @@ async def verify_fixes(source: str, findings: list) -> dict:
         message = f"Combined fixes do not parse: {error.msg}"
         for finding, fix in accepted:
             _set_verified(finding, fix, False, [message])
+            log.info(
+                "finding_dropped id=%s category=%s reason=%s",
+                ensure_finding_id(finding),
+                _finding_value(finding, "category", ""),
+                message,
+            )
         return {"semgrep_before": 0, "semgrep_after": 0, "accepted": 0}
     combined_names = undefined_names(combined) - undefined_names(source)
     if combined_names:
         message = "Combined fixes introduce undefined names: " + ", ".join(sorted(combined_names))
         for finding, fix in accepted:
             _set_verified(finding, fix, False, [message])
+            log.info(
+                "finding_dropped id=%s category=%s reason=%s",
+                ensure_finding_id(finding),
+                _finding_value(finding, "category", ""),
+                message,
+            )
         return {"semgrep_before": 0, "semgrep_after": 0, "accepted": 0}
 
     before, after = await asyncio.gather(

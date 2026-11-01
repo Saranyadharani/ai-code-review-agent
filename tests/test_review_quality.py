@@ -65,7 +65,10 @@ def test_rule_dedupe_keeps_security_finding_and_best_fix():
 
     assert result == [security]
     assert security.category == "security"
-    assert security.fix == bug.fix
+    assert security.fix["finding_id"] == security.id
+    assert {
+        key: value for key, value in security.fix.items() if key != "finding_id"
+    } == bug.fix
 
 
 def test_rule_dedupe_merges_similar_findings_and_shared_rule_ids():
@@ -165,6 +168,13 @@ SAMPLES = [
         "PEP 8 style recommendation",
         None,
     ),
+    (
+        "nullable_utils.py",
+        "value.name\n",
+        "bug",
+        "Possible None handling failure",
+        None,
+    ),
 ]
 
 
@@ -241,10 +251,62 @@ async def test_sample_review_publishes_one_categorized_issue_without_duplicate_s
         assert "```suggestion" not in all_text
         assert "json.load(stream)" not in all_text
         assert "ast.literal_eval(expression)" not in all_text
+        assert "data format and return type may differ" not in all_text
+        assert "changes behavior for valid expressions" not in all_text
     assert (
         f"/ {category}:" in all_text
         or "**HIGH / security:" in all_text
     )
+
+
+@pytest.mark.asyncio
+async def test_same_finding_decision_in_different_repository_layouts(monkeypatch):
+    results = []
+
+    class FakeGitHubClient:
+        async def list_pull_request_comments(self, owner, repo, number):
+            return []
+
+        async def create_pull_request_review(self, *args):
+            results.append(args)
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(publisher, "GitHubClient", FakeGitHubClient)
+    for path in ("src/services/worker.py", "packages/core/runtime.py"):
+        finding = Finding(
+            line=1,
+            category="security",
+            severity="high",
+            title="Unsafe shell execution",
+            explanation="Untrusted input reaches a shell command.",
+        )
+        finding.fix = {
+            "finding_id": finding.id,
+            "original": "run(command)",
+            "replacement": "run(command, shell=False)",
+            "note": "Pass arguments without shell interpretation.",
+            "verified": True,
+            "critic_safe": True,
+            "critic_verdict": {
+                "fixes_defect": True,
+                "breaks_valid_use": False,
+                "reason": "Private critic rationale.",
+            },
+        }
+        await publisher.post_review(
+            "acme", "unrelated", 1, "sha", path, [finding],
+            "@@ -1 +1 @@\n-run(command)\n+run(command, shell=False)\n",
+            "run(command)\n",
+            categories={"security"},
+        )
+
+    bodies = [comments[0]["body"] for _, _, _, _, _, comments in results]
+    normalized = [body.split("\n\n<!-- review-agent:")[0] for body in bodies]
+    assert normalized[0] == normalized[1]
+    assert all("Private critic rationale" not in body for body in bodies)
+    assert all("```suggestion\nrun(command, shell=False)\n```" in body for body in bodies)
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,8 @@
 """Step 4: LangGraph workflow.  (bug || security) -> validate -> fix -> verify"""
 import ast
+import asyncio
 import json
+import logging
 import re
 from typing import Literal, TypedDict
 
@@ -13,12 +15,17 @@ from app.review_rules import (
     category_for_rule,
     correct_category,
     deduplicate_findings,
+    ensure_finding_id,
     find_text_occurrence,
     is_style_only,
 )
-from app.verify import verify_fixes
+from app.verify import is_base_version_revert, verify_fixes
+
+log = logging.getLogger("review-agent")
+CRITIC_TIMEOUT_SECONDS = 20
 
 class Finding(BaseModel):
+    id: str = ""
     line: int
     category: Literal["bug", "security", "performance", "quality", "dependency", "impact"]
     title: str
@@ -28,6 +35,10 @@ class Finding(BaseModel):
     source: str = "llm"  # llm | semgrep
     rule_id: str | None = None
     fix: dict | None = None
+    critic_verdict: dict | None = None
+
+    def model_post_init(self, __context) -> None:
+        ensure_finding_id(self)
 
 
 class State(TypedDict, total=False):
@@ -212,6 +223,7 @@ async def impact_node(s: State):
     findings = _build(data or [], "findings", "impact")
     accepted = []
     for finding in findings:
+        finding_id = ensure_finding_id(finding)
         description = f"{finding.title}\n{finding.explanation}"
         if any(f"{caller['file']}:{caller['line']}" in description for caller in callers):
             accepted.append(finding)
@@ -226,6 +238,11 @@ async def impact_node(s: State):
         )
         if mentions_referenced_removed_symbol:
             accepted.append(finding)
+        else:
+            log.info(
+                "finding_dropped id=%s category=%s reason=no_retrieved_affected_caller",
+                finding_id, finding.category,
+            )
     return {"impact": accepted}
 
 
@@ -259,12 +276,18 @@ async def validate_node(s: State):
         for h in s["ctx"].get("ruff", [])
     )
     for hint in static_hints:
+        candidate = Finding(**hint)
         if not any(
-            finding.category == hint["category"]
-            and abs(finding.line - hint["line"]) <= 2
+            finding.category == candidate.category
+            and abs(finding.line - candidate.line) <= 2
             for finding in merged
         ):
-            merged.append(Finding(**hint))
+            merged.append(candidate)
+        else:
+            log.info(
+                "finding_dropped id=%s category=%s reason=static_hint_covered",
+                ensure_finding_id(candidate), candidate.category,
+            )
     allowed_categories = {
         category.strip().lower()
         for category in settings.review_categories.split(",")
@@ -275,8 +298,16 @@ async def validate_node(s: State):
         category = correct_category(finding)
         if category in {"performance", "quality"} and finding.severity.lower() == "low":
             if category not in allowed_categories:
+                log.info(
+                    "finding_dropped id=%s category=%s reason=low_severity_noise",
+                    ensure_finding_id(finding), category,
+                )
                 continue
         if is_style_only(finding) and "quality" not in allowed_categories:
+            log.info(
+                "finding_dropped id=%s category=%s reason=style_noise",
+                ensure_finding_id(finding), category,
+            )
             continue
         filtered.append(finding)
     deduplicated = deduplicate_findings(filtered)
@@ -286,53 +317,181 @@ async def validate_node(s: State):
 async def fix_node(s: State):
     """Ask for fixes and an independent behavior-preservation critique."""
     todo = [
-        (i, f) for i, f in enumerate(s["findings"])
+        f for f in s["findings"]
         if f.severity in ("high", "medium") and f.category != "impact"
     ]
+    eligible_ids = {ensure_finding_id(finding) for finding in todo}
+    for finding in s["findings"]:
+        if ensure_finding_id(finding) not in eligible_ids:
+            log.info(
+                "finding_decision id=%s category=%s decision=rejected source=no-fix "
+                "reason=not_eligible_for_fix",
+                ensure_finding_id(finding), finding.category,
+            )
     if not todo:
         return {}
-    listing = "\n".join(f"{i}: line {f.line}: {f.title}" for i, f in todo)
+    listing = "\n".join(
+        f"- finding_id={ensure_finding_id(f)} line={f.line} "
+        f"category={f.category} title={f.title}"
+        for f in todo
+    )
     data = await ask_json(
         "TASK: FIXES. For each issue below propose a minimal fix. Preserve imports at the top of the file; "
         "never add imports inside a function or midway through executable module code. If an import cannot "
         "be safely placed with the existing top-level imports, provide advice only. "
-        "Reply as JSON object with key \"fixes\" "
-        "(a list); each item has index (int), original (the EXACT existing text to replace, copied from the "
-        "source without line numbers), replacement (the new text).\nIssues:\n" + listing + "\n\n" + _header(s))
-    for it in _items(data, "fixes"):
+        "Reply as JSON object with key \"fixes\" (a list); each item has finding_id, original "
+        "(the EXACT existing text to replace), replacement, and note (short advice if rejected). "
+        "Never use list positions or indices.\nIssues:\n" + listing + "\n\n" + _header(s))
+    findings_by_id = {ensure_finding_id(finding): finding for finding in todo}
+    fixes_by_id = {}
+    for item in _items(data, "fixes"):
         try:
-            f, orig, new = s["findings"][int(it["index"])], it["original"], it["replacement"]
-        except (KeyError, ValueError, IndexError, TypeError):
+            finding_id = item["finding_id"]
+            original = item["original"]
+            replacement = item["replacement"]
+            note = item.get("note", "")
+        except (KeyError, TypeError):
             continue
-        if not isinstance(orig, str) or not isinstance(new, str):
+        if (
+            finding_id not in findings_by_id
+            or not isinstance(original, str)
+            or not isinstance(replacement, str)
+            or not isinstance(note, str)
+        ):
             continue
-        occurrence = find_text_occurrence(s["source"], orig, f.line)
+        finding = findings_by_id[finding_id]
+        occurrence = find_text_occurrence(s["source"], original, finding.line)
         if occurrence is None:
+            finding.fix = {
+                "finding_id": finding_id,
+                "original": original,
+                "replacement": replacement,
+                "note": note.strip(),
+                "verified": False,
+                "critic_safe": False,
+                "problems": ["Original text was not found in the source."],
+            }
+            log.info(
+                "finding_decision id=%s category=%s decision=rejected source=fix-agent "
+                "reason=original_text_not_found",
+                finding_id, finding.category,
+            )
             continue
-        critique = await ask_json(
-            "TASK: FIX CRITIC. Does this fix preserve behaviour for valid inputs? "
-            "Reply JSON {safe: bool, reason}. Evaluate the original and proposed code conservatively.\n"
-            f"Finding: {f.title}\n{f.explanation}\nOriginal:\n{orig}\nReplacement:\n{new}"
-        )
-        safe = isinstance(critique, dict) and critique.get("safe") is True
-        reason = (
-            str(critique.get("reason", "")).strip()
-            if isinstance(critique, dict) else ""
-        )
-        f.fix = {
-            "original": orig,
-            "replacement": new,
+        fix = {
+            "finding_id": finding_id,
+            "original": original,
+            "replacement": replacement,
             "start_line": occurrence[1],
-            "critic_safe": safe,
-            "critic_reason": reason or ("Critic rejected behavior preservation." if not safe else ""),
+            "note": note.strip(),
         }
-        if not safe:
-            f.suggestion = reason or "The proposed fix could not be confirmed as behavior-preserving."
+        fixes_by_id[finding_id] = fix
+
+    for finding_id, finding in findings_by_id.items():
+        fix = fixes_by_id.get(finding_id)
+        if fix is None:
+            log.info(
+                "finding_decision id=%s category=%s decision=rejected source=fix-agent "
+                "reason=no_fix_proposed",
+                finding_id, finding.category,
+            )
+            continue
+        if is_base_version_revert(
+            s["source"],
+            s["ctx"].get("base_source"),
+            s["ctx"].get("unified_diff", ""),
+            finding,
+            fix["original"],
+            fix["replacement"],
+        ):
+            finding.critic_verdict = {
+                "fixes_defect": True,
+                "breaks_valid_use": False,
+                "reason": "Restores the base-version line modified by this pull request.",
+                "source": "base-revert",
+            }
+            fix["critic_verdict"] = finding.critic_verdict
+            fix["critic_safe"] = True
+            fix["base_revert"] = True
+            finding.fix = fix
+            log.info(
+                "finding_decision id=%s category=%s decision=accepted source=base-revert",
+                finding_id, finding.category,
+            )
+            continue
+
+        prompt = (
+            f"Finding id: {finding_id}\n"
+            "Does this fix correct the flagged defect WITHOUT breaking valid uses? "
+            "Changing the buggy behaviour is expected and allowed. Reject only if it changes the "
+            "public signature, return type or data/file format for valid inputs, removes the flagged "
+            "functionality, swaps the flagged code for a trivial value, or alters unrelated lines.\n"
+            "Reply strictly as JSON with exactly these keys and types: "
+            '{"fixes_defect": bool, "breaks_valid_use": bool, "reason": str}.\n'
+            f"Finding: {finding.title}\n{finding.explanation}\n"
+            f"Original:\n{fix['original']}\nReplacement:\n{fix['replacement']}"
+        )
+        verdict = None
+        critic_source = "deterministic-fallback"
+        critic_error = "critic output unavailable"
+        for attempt in range(2):
+            try:
+                response = await asyncio.wait_for(
+                    ask_json(prompt), timeout=CRITIC_TIMEOUT_SECONDS
+                )
+                if (
+                    isinstance(response, dict)
+                    and set(response) == {"fixes_defect", "breaks_valid_use", "reason"}
+                    and type(response["fixes_defect"]) is bool
+                    and type(response["breaks_valid_use"]) is bool
+                    and isinstance(response["reason"], str)
+                ):
+                    verdict = response
+                    critic_source = "critic"
+                    break
+                critic_error = "critic returned an invalid verdict shape"
+            except (asyncio.TimeoutError, TimeoutError):
+                critic_error = "critic timed out"
+            except Exception as error:
+                critic_error = f"critic failed: {type(error).__name__}"
+            if attempt == 0:
+                log.info("critic_retry id=%s reason=%s", finding_id, critic_error)
+        if verdict is not None:
+            finding.critic_verdict = {**verdict, "source": "critic"}
+            fix["critic_verdict"] = finding.critic_verdict
+            fix["critic_safe"] = (
+                verdict["fixes_defect"] and not verdict["breaks_valid_use"]
+            )
+            fix["critic_reason"] = verdict["reason"]
+        else:
+            finding.critic_verdict = None
+            fix["critic_safe"] = True
+            fix["critic_reason"] = ""
+            fix["critic_failure"] = critic_error
+        finding.fix = fix
+        accepted = (
+            verdict["fixes_defect"] and not verdict["breaks_valid_use"]
+            if verdict is not None else None
+        )
+        log.info(
+            "finding_decision id=%s category=%s decision=%s source=%s reason=%s",
+            finding_id,
+            finding.category,
+            "accepted" if accepted is True else "rejected" if accepted is False else "pending-guards",
+            critic_source,
+            verdict["reason"] if verdict is not None else critic_error,
+        )
     return {}
 
 
 async def verify_node(s: State):
-    return {"verify": await verify_fixes(s["source"], s["findings"])}
+    return {
+        "verify": await verify_fixes(
+            s["source"],
+            s["findings"],
+            base_source=s["ctx"].get("base_source"),
+            unified_diff=s["ctx"].get("unified_diff", ""),
+        )
+    }
 
 
 def _build_graph():

@@ -1,5 +1,4 @@
 import json
-import hashlib
 
 import httpx
 import pytest
@@ -76,7 +75,7 @@ async def test_post_review_comments_only_on_changed_lines(monkeypatch):
             "**HIGH / bug: Incorrect result**\n\n"
             "The result is off by one.\n\n"
             "```suggestion\nreturn total\n```\n\n"
-            f"<!-- review-agent:{hashlib.sha1(b'src/app.py2Incorrect result').hexdigest()} -->"
+            + publisher._finding_marker("src/app.py", findings[0])
         ),
     }]
     assert clients[0].closed
@@ -463,7 +462,7 @@ async def test_marker_dedupe_uses_existing_github_comments(monkeypatch):
     first = await publisher.post_reviews("acme", "widgets", 20, "sha", inputs)
     second = await publisher.post_reviews("acme", "widgets", 20, "sha", inputs)
 
-    marker = f"<!-- review-agent:{hashlib.sha1(b'app.py1Unsafe operation').hexdigest()} -->"
+    marker = publisher._finding_marker("app.py", finding)
     assert first == {"published": True, "comments": 1, "summary_findings": 0}
     assert marker in posted_reviews[0][-1][0]["body"]
     assert second == {"published": False, "comments": 0, "summary_findings": 0}

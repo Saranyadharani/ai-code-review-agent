@@ -239,6 +239,7 @@ async def build_file_context(
         "ruff": ruff,
         "unified_diff": patch or "",
         "semantic_diff": semantic_diff(base_source, source),
+        "base_source": base_source,
     }
     if baseline is not None:
         result["baseline_comparison"] = baseline
