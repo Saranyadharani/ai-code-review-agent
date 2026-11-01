@@ -1,57 +1,98 @@
 # AI Code Review Agent
 
-GitHub → FastAPI → analyze changed Python and dependency files → optionally publish a PR review.
+An automated reviewer for changed Python code and dependency files in GitHub pull requests. It combines static analysis with focused AI review tasks, checks proposed fixes, and can optionally publish findings to GitHub.
 
-## Run it
+## Run locally
+
+Copy `.env.example` to `.env` and configure the required credentials:
 
 ```bash
-cp .env.example .env        # fill in GITHUB_TOKEN and GITHUB_WEBHOOK_SECRET
+copy .env.example .env
+```
+
+Then start the API:
+
+```bash
 docker compose up --build
 ```
 
-API at http://localhost:8010 (docs at /docs).
+The API is available at http://localhost:8010, with interactive documentation at http://localhost:8010/docs.
 
-Architecture Diagram 
+The project can also run as a GitHub Actions workflow without hosting the API. See [`.github/workflows/review.yml`](.github/workflows/review.yml).
 
-<img width="6225" height="2913" alt="image" src="https://github.com/user-attachments/assets/8152675c-11d5-4f4a-be5e-72a20803fd78" />
+## Architecture Diagram
+
+<img width="6225" height="2913" alt="image" src="https://github.com/user-attachments/assets/8152675c-11d5-4f4f-be5e-72a20803fd78" />
+
+## How a review works
+
+1. **Start:** GitHub Actions runs `python -m app.cli`, or GitHub sends a signed webhook to the FastAPI app.
+2. **Collect PR data:** `run_review()` fetches pull-request details, changed files, diffs, and file contents.
+3. **Build Python context:** Tree-sitter identifies imports, classes, functions, and changed code. Semgrep and Ruff scan the Python source and provide hints. When the base version is available, analyzer results are compared with the PR version.
+4. **Review Python changes:** LangGraph runs focused tasks for bugs, security, and performance. Quality review is opt-in. Impact review uses related callers when available.
+5. **Check dependencies:** Changed `requirements*.txt` and `pyproject.toml` files are checked against OSV for pinned PyPI versions.
+6. **Validate and verify:** Findings are categorized and deduplicated. A fix may be proposed and critiqued; deterministic checks inspect the patched source.
+7. **Publish:** If publishing is enabled, findings are posted as inline comments or in a review summary. Verified fixes can be included as GitHub suggestion blocks for the repository owner to review and apply.
+
+The review tasks are separate prompts in one LangGraph workflow, not separate programs or different AI models. Semgrep and Ruff are static-analysis tools, not agents.
+
+## Review coverage
+
+### Python code
+
+- **Bug review:** Logic errors and missed edge cases, such as off-by-one errors, mutable defaults, swallowed exceptions, and likely type errors.
+- **Security review:** Possible risks such as injection, unsafe deserialization, `eval`, hardcoded secrets, and weak cryptography.
+- **Performance review:** Meaningful inefficiencies, such as repeated expensive work in loops or inefficient data structures.
+- **Quality review:** Style and maintainability issues such as naming, complexity, missing docstrings, or missing type hints. Enable `quality` in `REVIEW_CATEGORIES` to use this review.
+- **Impact review:** Potential effects on code that calls changed functions. This uses a lightweight, name-based repository index when available.
+
+### Static analysis
+
+- **Semgrep** checks patterns defined in [`rules/python.yml`](rules/python.yml), such as `eval`, unsafe pickle/YAML loading, SQL f-strings, and shell-command risks.
+- **Ruff** checks selected built-in Python rules for security, bugs, performance, and quality. Ruff does not use `rules/python.yml`.
+- Both tools provide hints; a match is not by itself proof of a defect. The review tasks assess the code and context.
+
+### Dependency review
+
+When a dependency file changes, the app parses dependencies and checks exact-pinned PyPI versions against the OSV vulnerability database. If a known vulnerability has a fixed version, the finding can recommend that version. Unpinned dependencies are reported as not checkable.
+
+## Publishing and configuration
+
+Reviews are disabled by default. To publish comments, set:
+
+```env
+PUBLISH_REVIEWS=true
+```
+
+The GitHub token needs permission to read repository contents and pull requests, and to write pull-request reviews when publishing is enabled.
+
+Relevant settings:
+
+| Setting | Purpose |
+|---|---|
+| `GITHUB_TOKEN` | Accesses GitHub repositories and pull requests |
+| `GITHUB_WEBHOOK_SECRET` | Verifies webhook requests when using the API webhook |
+| `GROQ_API_KEY` | Enables AI review tasks |
+| `PUBLISH_REVIEWS` | Enables or disables posting reviews |
+| `REVIEW_CATEGORIES` | Selects findings to publish; defaults to `security,bug,performance,dependency,impact`. Add `quality` to opt in |
+| `MAX_INLINE_COMMENTS` | Limits inline comments; defaults to `15`. Overflow findings go in the review summary |
+
+See [`app/config.py`](app/config.py) for application defaults.
+
+## GitHub Actions
+
+The workflow runs when a pull request is opened, reopened, or updated with new commits. It skips draft pull requests and pull requests from forks. Configure the `GROQ_API_KEY` repository secret; the workflow uses GitHub's built-in `GITHUB_TOKEN` to access the pull request and publish reviews. Set **Settings → Actions → General → Workflow permissions** to **Read and write**.
 
 
-## Milestone checks
+## Limitations and security notes
 
-1. **Token works**: `curl localhost:8010/repos/OWNER/REPO/pulls` lists open PRs.
-2. **Read changed files**: `curl -X POST localhost:8010/review/OWNER/REPO/PR_NUMBER`
-   returns the PR metadata and every changed file with its diff patch.
-3. **Webhook**: expose port 8010 (e.g. `ngrok http 8010`), then in the repo go to
-   Settings → Webhooks → Add webhook:
-   - Payload URL: `https://<ngrok-id>.ngrok.app/webhook/github`
-   - Content type: `application/json`
-   - Secret: same as `GITHUB_WEBHOOK_SECRET`
-   - Events: Pull requests
-   Open a PR and watch the API logs for the review results.
-
-## Token scopes
-Fine-grained PAT with Pull requests: read and Contents: read. Set
-`PUBLISH_REVIEWS=true` and grant Pull requests: write to publish reviews. Reviews
-are disabled by default. Findings on changed lines become inline comments;
-findings outside the diff go in the review summary. Verified fixes are formatted
-as GitHub suggestions. Identical findings are deduplicated in process memory,
-so the cache resets when the API restarts.
-
-## Review coverage and noise controls
-Python files are scanned with local Semgrep rules and Ruff. Ruff findings are
-categorized as security, bug, performance, or quality; the LangGraph review
-includes bug, security, performance, and quality analysis. Changed
-`requirements*.txt` and `pyproject.toml` files are checked against OSV for
-exactly pinned PyPI dependencies; unpinned dependencies are reported as
-unchecked.
-
-`REVIEW_CATEGORIES` controls which categories are published and defaults to
-`security,bug,performance,dependency`. Add `quality` to opt in. `MAX_INLINE_COMMENTS`
-defaults to `15`; higher-severity findings are prioritized, and overflow is
-included in the review summary. Low-severity and quality findings are summary
-only.
-
-## Tests
-`pytest` (external GitHub, OSV, and Groq calls are mocked).
-
-The optional n8n notification/approval workflow remains optional and was not implemented.
+- AI and static analysis can miss issues or report false positives. Review findings before applying them.
+- Proposed fixes are checked in memory; pull-request code is not executed, and the verifier does not run the repository's test suite.
+- A verified fix may be offered as a GitHub suggestion, but the agent does not apply or merge it automatically.
+- Deterministic fix checks are conservative: a correct fix may be shown as advice only, without a one-click suggestion.
+- Impact analysis is lightweight and name-based, so it may miss dynamic calls or confuse functions with the same name.
+- Dependency checks require exact pinned versions and depend on OSV's available data.
+- Only relevant changed code and related context are sent for review; the tool does not fully understand the entire repository.
+- The configured LLM provider's data policies apply to code sent for analysis. Do not send private code unless that use is approved.
+- A PostgreSQL service is present in Docker Compose, but the current review flow does not persist review results to it.
+- The optional n8n notification/approval workflow has not been implemented.
