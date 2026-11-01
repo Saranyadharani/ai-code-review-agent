@@ -2,27 +2,9 @@
 
 An automated reviewer for changed Python code and dependency files in GitHub pull requests. It combines static analysis with focused AI review tasks, checks proposed fixes, and can optionally publish findings to GitHub.
 
-## Run locally
-
-Copy `.env.example` to `.env` and configure the required credentials:
-
-```bash
-copy .env.example .env
-```
-
-Then start the API:
-
-```bash
-docker compose up --build
-```
-
-The API is available at http://localhost:8010, with interactive documentation at http://localhost:8010/docs.
-
-The project can also run as a GitHub Actions workflow without hosting the API. See [`.github/workflows/review.yml`](.github/workflows/review.yml).
-
 ## Architecture Diagram
 
-<img width="6225" height="2913" alt="image" src="https://github.com/user-attachments/assets/8152675c-11d5-4f4f-be5e-72a20803fd78" />
+<img width="6225" height="2913" alt="image" src="https://github.com/user-attachments/assets/bbe98589-ae8e-4d11-b64c-34f0e5d841c2" />
 
 ## How a review works
 
