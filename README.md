@@ -64,17 +64,3 @@ See [`app/config.py`](app/config.py) for application defaults.
 ## GitHub Actions
 
 The workflow runs when a pull request is opened, reopened, or updated with new commits. It skips draft pull requests and pull requests from forks. Configure the `GROQ_API_KEY` repository secret; the workflow uses GitHub's built-in `GITHUB_TOKEN` to access the pull request and publish reviews. Set **Settings → Actions → General → Workflow permissions** to **Read and write**.
-
-
-## Limitations and security notes
-
-- AI and static analysis can miss issues or report false positives. Review findings before applying them.
-- Proposed fixes are checked in memory; pull-request code is not executed, and the verifier does not run the repository's test suite.
-- A verified fix may be offered as a GitHub suggestion, but the agent does not apply or merge it automatically.
-- Deterministic fix checks are conservative: a correct fix may be shown as advice only, without a one-click suggestion.
-- Impact analysis is lightweight and name-based, so it may miss dynamic calls or confuse functions with the same name.
-- Dependency checks require exact pinned versions and depend on OSV's available data.
-- Only relevant changed code and related context are sent for review; the tool does not fully understand the entire repository.
-- The configured LLM provider's data policies apply to code sent for analysis. Do not send private code unless that use is approved.
-- A PostgreSQL service is present in Docker Compose, but the current review flow does not persist review results to it.
-- The optional n8n notification/approval workflow has not been implemented.
