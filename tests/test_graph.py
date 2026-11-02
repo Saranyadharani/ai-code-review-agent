@@ -57,6 +57,10 @@ async def test_new_nodes_use_matching_ruff_hints(monkeypatch):
     assert "late-binding closures" in prompts[2]
     assert "B023" in prompts[2] and "S307" not in prompts[2]
     assert "S307" in prompts[3] and "B023" not in prompts[3]
+    assert all(
+        "Only an excerpt of the file is shown. Do not report undefined names" in prompt
+        for prompt in (prompts[2], prompts[3])
+    )
 
 
 @pytest.mark.asyncio
@@ -608,7 +612,108 @@ def test_header_includes_imports_and_only_changed_functions():
     assert "3: def changed():" in header
     assert "4:     return os.getenv('X')" in header
     assert "unchanged" not in header
-    assert "constant = 1" not in header
+    assert "2: constant = 1" in header
+
+
+def test_header_includes_module_assignments_capped_at_40_lines():
+    assignments = "\n".join(f"VALUE_{number} = {number}" for number in range(45))
+    state = {
+        "filename": "app.py",
+        "source": assignments,
+        "ctx": {"changed_functions": []},
+    }
+
+    header = graph._header(state)
+
+    assert "1: VALUE_0 = 0" in header
+    assert "40: VALUE_39 = 39" in header
+    assert "41: VALUE_40 = 40" not in header
+    assert "45: VALUE_44 = 44" not in header
+
+
+@pytest.mark.asyncio
+async def test_validate_drops_unverified_undefined_name_claims(monkeypatch, caplog):
+    monkeypatch.setattr(
+        graph.settings, "review_categories", "security,bug,performance"
+    )
+    caplog.set_level(logging.INFO, logger="review-agent")
+    finding = graph.Finding(
+        line=2,
+        category="bug",
+        title="NameError: name 'missing_name' is not defined",
+        explanation="The function references a missing name.",
+    )
+
+    result = await graph.validate_node({
+        "source": "def f():\n    return value\n",
+        "bugs": [finding],
+        "ctx": {"semgrep": [], "ruff": []},
+    })
+
+    assert result["findings"] == []
+    assert "reason=unverified_undefined_name_claim" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_validate_keeps_undefined_name_claims_reported_by_pyflakes(monkeypatch):
+    monkeypatch.setattr(
+        graph.settings, "review_categories", "security,bug,performance"
+    )
+    finding = graph.Finding(
+        line=2,
+        category="bug",
+        title="Undefined name `missing_name`",
+    )
+
+    result = await graph.validate_node({
+        "source": "def f():\n    return missing_name\n",
+        "bugs": [finding],
+        "ctx": {"semgrep": [], "ruff": []},
+    })
+
+    assert result["findings"] == [finding]
+
+
+@pytest.mark.asyncio
+async def test_validate_drops_low_severity_speculation_without_static_hint(monkeypatch, caplog):
+    monkeypatch.setattr(
+        graph.settings, "review_categories", "security,bug,performance"
+    )
+    caplog.set_level(logging.INFO, logger="review-agent")
+    speculative = graph.Finding(
+        line=2,
+        category="bug",
+        severity="low",
+        title="Assumes the value is valid",
+    )
+    hinted_speculation = graph.Finding(
+        line=8,
+        category="bug",
+        severity="low",
+        title="May raise if the input is empty",
+    )
+
+    result = await graph.validate_node({
+        "source": (
+            "def f():\n    pass\n\n\n\n\n"
+            "def g():\n    pass\n"
+        ),
+        "bugs": [speculative, hinted_speculation],
+        "ctx": {
+            "semgrep": [],
+            "ruff": [
+                {
+                    "line": 8,
+                    "rule": "B023",
+                    "message": "Potential late-binding bug",
+                    "category": "bug",
+                }
+            ],
+        },
+    })
+
+    assert result["findings"] == [hinted_speculation]
+    assert "reason=low_severity_speculation" in caplog.text
 
 
 def test_header_keeps_multiline_imports_complete():

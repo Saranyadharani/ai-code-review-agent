@@ -27,13 +27,13 @@ def _finding_value(finding, key: str, default=""):
 
 
 def undefined_names(code: str) -> set[str]:
-    """Pyflakes 'undefined name' messages, without line numbers."""
+    """Return names reported as undefined by Pyflakes."""
     out = io.StringIO()
     check(code, "f.py", Reporter(out, out))
     return {
-        line.split(":", 3)[-1].strip()
+        match.group(1)
         for line in out.getvalue().splitlines()
-        if "undefined name" in line
+        if (match := re.search(r"undefined name ['\"]([^'\"]+)['\"]", line))
     }
 
 

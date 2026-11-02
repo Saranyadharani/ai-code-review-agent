@@ -3,6 +3,12 @@ import pytest
 from app import verify
 
 
+def test_undefined_names_returns_pyflakes_symbol_names():
+    assert verify.undefined_names(
+        "def f():\n    return missing_name\n"
+    ) == {"missing_name"}
+
+
 @pytest.mark.asyncio
 async def test_behavior_preserving_axis_fix_is_verified(monkeypatch):
     monkeypatch.setattr(verify, "run_semgrep", lambda source: [])

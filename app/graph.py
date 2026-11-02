@@ -19,11 +19,38 @@ from app.review_rules import (
     find_text_occurrence,
     is_style_only,
 )
-from app.verify import is_base_version_revert, verify_fixes
+from app.verify import is_base_version_revert, undefined_names, verify_fixes
 
 log = logging.getLogger("review-agent")
 CRITIC_TIMEOUT_SECONDS = 20
 QUALITY_FINDINGS_PER_FUNCTION = 3
+_UNDEFINED_NAME_PATTERNS = (
+    re.compile(
+        r"\bundefined\s+(?:name|variable|symbol)\s*(?:[:=]\s*)?[`'\"]?([A-Za-z_]\w*)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bname\s+[`'\"]([A-Za-z_]\w*)[`'\"]\s+(?:is\s+)?(?:not defined|not imported)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b([A-Za-z_]\w*)\s+(?:is\s+)?(?:undefined|not imported|not defined)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bmissing\s+(?:import|definition)(?:\s+(?:for|of))?\s+[`'\"]?([A-Za-z_]\w*)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bNameError\b[^.\n]*?\bname\s+[`'\"]([A-Za-z_]\w*)[`'\"]",
+        re.IGNORECASE,
+    ),
+)
+_UNDEFINED_NAME_CLAIM = re.compile(
+    r"\b(?:undefined|not defined|not imported|missing imports?|missing definitions?|NameError)\b",
+    re.IGNORECASE,
+)
+_SPECULATIVE_BUG = re.compile(r"\bassumes\b|\bmay raise if\b", re.IGNORECASE)
 
 
 def _configured_categories() -> set[str]:
@@ -116,6 +143,19 @@ def _header(s: State) -> str:
                 selected_lines.update(
                     range(node.lineno, getattr(node, "end_lineno", node.lineno) + 1)
                 )
+        assignment_line_count = 0
+        for node in tree.body:
+            if not isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                continue
+            start = node.lineno
+            end = getattr(node, "end_lineno", start)
+            for number in range(start, end + 1):
+                if assignment_line_count >= 40:
+                    break
+                selected_lines.add(number)
+                assignment_line_count += 1
+            if assignment_line_count >= 40:
+                break
     changed = set(s["ctx"].get("changed_functions", []))
     module_lines = s["ctx"].get("module_context_lines", [])
     if "<module>" in changed:
@@ -134,7 +174,7 @@ def _header(s: State) -> str:
     semantic = json.dumps(s["ctx"].get("semantic_diff", {}), sort_keys=True)
     diff = s["ctx"].get("unified_diff", "")
     return (f"File: {s['filename']}\nChanged functions: {', '.join(s['ctx']['changed_functions']) or 'none'}\n"
-            f"Imports, changed-function and module-level source:\n"
+            f"Imports, module-level assignments and changed-function source:\n"
             f"{numbered or '(no changed source found)'}\n"
             f"Unified PR diff:\n{diff or '(unavailable)'}\n"
             f"Semantic diff summary:\n{semantic}\n"
@@ -155,6 +195,8 @@ async def bug_node(s: State):
         "division by zero, mutable defaults, wrong conditions, swallowed errors, late-binding closures, "
         "shadowed builtins, UnboundLocalError risks, `except Exception: pass`, wrong except ordering, "
         "and likely TypeError or AttributeError) in the CHANGED functions only. No security issues. "
+        "Only an excerpt of the file is shown. Do not report undefined names, missing definitions or "
+        "missing imports unless a static-analysis hint says so. "
         f"Ruff hints:\n{hints}\nReply as JSON object with key \"bugs\" (a list). "
         f"{KEYS}\n\n" + _header(s))
     return {"bugs": _build(data or [], "bugs", "bug")}
@@ -173,7 +215,9 @@ async def security_node(s: State):
     data = await ask_json(
         "TASK: SECURITY. You are a security reviewer. Report real vulnerabilities in the CHANGED functions "
         "(injection, unsafe deserialization, eval, hardcoded secrets, path traversal, ...). Static-analysis "
-        f"hints follow; confirm the real ones and drop false positives.\nHints:\n{hints}\n"
+        "hints follow; confirm the real ones and drop false positives. Only an excerpt of the file is shown. "
+        "Do not report undefined names, missing definitions or missing imports unless a static-analysis "
+        f"hint says so.\nHints:\n{hints}\n"
         f"Reply as JSON object with key \"findings\" (a list). {KEYS}\n\n" + _header(s))
     return {"security": _build(data or [], "findings", "security")}
 
@@ -332,7 +376,40 @@ async def validate_node(s: State):
             )
     allowed_categories = _configured_categories()
     filtered = []
+    full_source_undefined_names = None
     for finding in merged:
+        finding_text = f"{finding.title}\n{finding.explanation}"
+        is_undefined_claim = bool(_UNDEFINED_NAME_CLAIM.search(finding_text))
+        if finding.source == "llm" and is_undefined_claim:
+            if full_source_undefined_names is None:
+                full_source_undefined_names = undefined_names(s["source"])
+            claimed_names = {
+                match.group(1)
+                for pattern in _UNDEFINED_NAME_PATTERNS
+                if (match := pattern.search(finding_text))
+            }
+            if not claimed_names or not claimed_names.issubset(full_source_undefined_names):
+                log.info(
+                    "finding_dropped id=%s category=%s reason=unverified_undefined_name_claim",
+                    ensure_finding_id(finding), finding.category,
+                )
+                continue
+        if (
+            finding.source == "llm"
+            and finding.category == "bug"
+            and finding.severity.lower() == "low"
+            and _SPECULATIVE_BUG.search(finding_text)
+        ):
+            has_static_hint = any(
+                hint["category"] == "bug" and abs(finding.line - hint["line"]) <= 2
+                for hint in static_hints
+            )
+            if not has_static_hint:
+                log.info(
+                    "finding_dropped id=%s category=bug reason=low_severity_speculation",
+                    ensure_finding_id(finding),
+                )
+                continue
         category = correct_category(finding)
         if is_style_only(finding) and category != "security":
             if "quality" not in allowed_categories:
